@@ -1408,80 +1408,6 @@ function ActivityRings({ calories, steps, water, draw, night = false }: { calori
   );
 }
 
-const SPOTIFY_MIX = [
-  { title: 'Midnight Tempo', artist: 'FitBite Radio', tempo: 126 },
-  { title: 'Hill Repeats', artist: 'FitBite Radio', tempo: 140 },
-  { title: 'Cool Down', artist: 'FitBite Radio', tempo: 96 },
-];
-
-function createWorkoutBeats() {
-  const tempos = SPOTIFY_MIX.map((track) => track.tempo);
-  let ctx: AudioContext | null = null;
-  let hat: AudioBuffer | null = null;
-  let timer = 0;
-  let step = 0;
-
-  const audio = () => {
-    if (!ctx) ctx = new AudioContext();
-    if (!hat) {
-      hat = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.04), ctx.sampleRate);
-      const data = hat.getChannelData(0);
-      for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
-    }
-    return ctx;
-  };
-
-  const pulse = () => {
-    const node = audio();
-    const t = node.currentTime;
-    if (step % 4 === 0) {
-      const osc = node.createOscillator();
-      const gain = node.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(step % 8 === 0 ? 156 : 118, t);
-      osc.frequency.exponentialRampToValueAtTime(46, t + 0.14);
-      gain.gain.setValueAtTime(0.85, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-      osc.connect(gain);
-      gain.connect(node.destination);
-      osc.start(t);
-      osc.stop(t + 0.2);
-    }
-    if (hat && step % 2 === 1) {
-      const src = node.createBufferSource();
-      const gain = node.createGain();
-      src.buffer = hat;
-      gain.gain.value = 0.16;
-      src.connect(gain);
-      gain.connect(node.destination);
-      src.start(t);
-    }
-    step = (step + 1) % 16;
-  };
-
-  return {
-    play(index: number) {
-      step = 0;
-      const node = audio();
-      void node.resume();
-      window.clearInterval(timer);
-      pulse();
-      const ms = Math.max(90, Math.round(60000 / (tempos[index] ?? 120) / 2));
-      timer = window.setInterval(pulse, ms);
-    },
-    pause() {
-      window.clearInterval(timer);
-      void ctx?.suspend();
-    },
-    stop() {
-      window.clearInterval(timer);
-      void ctx?.close().catch(() => undefined);
-      ctx = null;
-      hat = null;
-    },
-  };
-}
-
 function openSpotifyApp() {
   const fallback = window.setTimeout(() => {
     if (document.visibilityState === 'visible') window.open('https://open.spotify.com', '_blank', 'noopener,noreferrer');
@@ -1493,124 +1419,64 @@ function openSpotifyApp() {
   window.location.href = 'spotify://';
 }
 
+function nativeMusic() {
+  return (window as Window & { FitBiteNative?: { openPhoneMusicApp?: () => void; pickAudioTrack?: () => void } }).FitBiteNative;
+}
+
 function MusicHub() {
-  const beats = useRef<ReturnType<typeof createWorkoutBeats> | null>(null);
   const phoneAudio = useRef<HTMLAudioElement | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
-  const [source, setSource] = useState<'spotify' | 'phone'>('spotify');
-  const [trackIndex, setTrackIndex] = useState(0);
+  const [track, setTrack] = useState<{ name: string; url: string } | null>(null);
   const [playing, setPlaying] = useState(false);
-  const [phoneFiles, setPhoneFiles] = useState<{ name: string; url: string }[]>([]);
-  const [phoneIndex, setPhoneIndex] = useState(0);
-  const [phonePlaying, setPhonePlaying] = useState(false);
-  const track = SPOTIFY_MIX[trackIndex] ?? SPOTIFY_MIX[0];
-  const phone = phoneFiles[phoneIndex];
 
-  useEffect(() => () => {
-    beats.current?.stop();
-    phoneAudio.current?.pause();
-    setPhoneFiles((rows) => {
-      rows.forEach((row) => URL.revokeObjectURL(row.url));
-      return [];
-    });
+  useEffect(() => {
+    const onPick = (name: string, path: string) => {
+      const url = /^(https?:|blob:|data:|capacitor:)/.test(path) ? path : Capacitor.convertFileSrc(path);
+      setTrack({ name: name || 'Selected track', url });
+      const audio = phoneAudio.current ?? new Audio();
+      phoneAudio.current = audio;
+      audio.src = url;
+      audio.onended = () => setPlaying(false);
+      void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+    };
+    (window as Window & { fitbiteOnAudioPicked?: (name: string, path: string) => void }).fitbiteOnAudioPicked = onPick;
+    return () => {
+      phoneAudio.current?.pause();
+      delete (window as Window & { fitbiteOnAudioPicked?: (name: string, path: string) => void }).fitbiteOnAudioPicked;
+    };
   }, []);
-
-  const engine = () => {
-    if (!beats.current) beats.current = createWorkoutBeats();
-    return beats.current;
-  };
-
-  const playMix = (index: number) => {
-    phoneAudio.current?.pause();
-    setPhonePlaying(false);
-    engine().play(index);
-    setTrackIndex(index);
-    setPlaying(true);
-  };
-
-  const playPhone = (index: number, rows = phoneFiles) => {
-    const file = rows[index];
-    if (!file) return;
-    beats.current?.pause();
-    setPlaying(false);
-    const audio = phoneAudio.current ?? new Audio();
-    phoneAudio.current = audio;
-    if (audio.src !== file.url) {
-      audio.src = file.url;
-      audio.onended = () => setPhonePlaying(false);
-    }
-    void audio.play().then(() => {
-      setPhoneIndex(index);
-      setPhonePlaying(true);
-    }).catch(() => setPhonePlaying(false));
-  };
 
   return (
     <div className="card mt-4 p-3.5">
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="text-sm font-black tracking-[-0.03em]">Workout Audio</h2>
-        <div className="grid grid-cols-2 rounded-full bg-slate-100 p-0.5 text-[10px] font-extrabold">
-          {([
-            ['spotify', 'Workout Audio'],
-            ['phone', 'Phone'],
-          ] as const).map(([id, label]) => (
-            <button key={id} type="button" className={`h-7 rounded-full px-2.5 ${source === id ? 'bg-white text-slate-900 shadow-sm' : 'text-muted'}`} onClick={() => setSource(id)}>
-              {label}
-            </button>
-          ))}
+      <h2 className="text-sm font-black tracking-[-0.03em]">Phone Music</h2>
+      <div className="mt-3 flex items-center gap-2.5">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-extrabold">{track?.name ?? 'Music library'}</div>
+          <div className="truncate text-[11px] text-muted">{track ? 'From your phone music library' : 'Open the music app or choose a track'}</div>
         </div>
+        <button
+          type="button"
+          className="grid h-10 w-10 place-items-center rounded-full bg-slate-900 text-xs font-black on-gradient disabled:opacity-40"
+          aria-label={playing ? 'Pause phone music' : 'Play phone music'}
+          disabled={!track}
+          onClick={() => {
+            const audio = phoneAudio.current;
+            if (!audio || !track) return;
+            if (playing) {
+              audio.pause();
+              setPlaying(false);
+            } else {
+              void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+            }
+          }}
+        >
+          {playing ? '❚❚' : '▶'}
+        </button>
       </div>
-      {source === 'spotify' ? (
-        <div className="mt-3 flex items-center gap-2.5">
-          <div className="on-gradient grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-[#0F1115] text-[11px] font-black">
-            {track.title.slice(0, 2).toUpperCase()}
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-extrabold">{track.title}</div>
-            <div className="truncate text-[11px] text-muted">{playing ? `${track.artist} · ${track.tempo} BPM` : 'Play a workout mix on this device'}</div>
-          </div>
-          <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100 text-sm font-black text-slate-900" aria-label="Previous track" onClick={() => playMix((trackIndex + SPOTIFY_MIX.length - 1) % SPOTIFY_MIX.length)}>‹</button>
-          <button type="button" className="grid h-10 w-10 place-items-center rounded-full bg-slate-900 text-xs font-black on-gradient" aria-label={playing ? 'Pause workout audio' : 'Play workout audio'} onClick={() => (playing ? (engine().pause(), setPlaying(false)) : playMix(trackIndex))}>
-            {playing ? '❚❚' : '▶'}
-          </button>
-          <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100 text-sm font-black text-slate-900" aria-label="Next track" onClick={() => playMix((trackIndex + 1) % SPOTIFY_MIX.length)}>›</button>
-        </div>
-      ) : (
-        <div className="mt-3 space-y-2">
-          <input ref={fileRef} className="hidden" type="file" accept="audio/*" multiple onChange={(event) => {
-            const picked = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('audio/') || /\.(mp3|m4a|aac|wav|ogg|flac)$/i.test(file.name));
-            event.target.value = '';
-            if (!picked.length) return;
-            const next = picked.map((file) => ({ name: file.name.replace(/\.[^.]+$/, ''), url: URL.createObjectURL(file) }));
-            setPhoneFiles((current) => {
-              current.forEach((row) => URL.revokeObjectURL(row.url));
-              return next;
-            });
-            playPhone(0, next);
-          }} />
-          <div className="flex items-center gap-2">
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-extrabold">{phone?.name ?? 'No track selected'}</div>
-              <div className="truncate text-[11px] text-muted">{phoneFiles.length ? `${phoneIndex + 1} of ${phoneFiles.length}` : 'Choose MP3s from this phone'}</div>
-            </div>
-            <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100 text-sm font-black text-slate-900" aria-label="Previous phone track" disabled={!phoneFiles.length} onClick={() => playPhone((phoneIndex + phoneFiles.length - 1) % phoneFiles.length)}>‹</button>
-            <button type="button" className="grid h-10 w-10 place-items-center rounded-full bg-slate-900 text-xs font-black on-gradient" aria-label={phonePlaying ? 'Pause phone audio' : 'Play phone audio'} disabled={!phone} onClick={() => {
-              if (!phone) return;
-              if (phonePlaying) {
-                phoneAudio.current?.pause();
-                setPhonePlaying(false);
-              } else playPhone(phoneIndex);
-            }}>
-              {phonePlaying ? '❚❚' : '▶'}
-            </button>
-            <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100 text-sm font-black text-slate-900" aria-label="Next phone track" disabled={!phoneFiles.length} onClick={() => playPhone((phoneIndex + 1) % phoneFiles.length)}>›</button>
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <button type="button" className={quietClass} onClick={() => fileRef.current?.click()}>Choose audio</button>
-            <button type="button" className={primaryClass} onClick={openSpotifyApp}>Open Spotify</button>
-          </div>
-        </div>
-      )}
+      <div className="mt-3 grid gap-2">
+        <button type="button" className={primaryClass} onClick={() => nativeMusic()?.openPhoneMusicApp?.()}>Phone Music</button>
+        <button type="button" className={quietClass} onClick={() => nativeMusic()?.pickAudioTrack?.()}>Choose a track</button>
+        <button type="button" className={quietClass} onClick={openSpotifyApp}>Open Spotify</button>
+      </div>
     </div>
   );
 }
