@@ -63,12 +63,12 @@ export function quotaLeft(kind: QuotaKind, pro: boolean) {
 }
 
 export function canSpend(kind: QuotaKind, pro: boolean) {
-  if (kind === 'coach') return true;
+  if (pro || kind === 'coach') return true;
   return quotaLeft(kind, pro).left > 0;
 }
 
 export function spendQuota(kind: QuotaKind, pro: boolean) {
-  if (kind === 'coach') return true;
+  if (pro || kind === 'coach') return true;
   if (!canSpend(kind, pro)) return false;
   const ledger = readLedger();
   ledger[kind] += 1;

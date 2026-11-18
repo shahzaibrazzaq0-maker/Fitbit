@@ -10,7 +10,7 @@ import { analyzeFoodPhoto, askNeural, engineRoute as readEngineRoute, lastAiWasB
 import { AI_CONSENT_KEY, DIET_KEY, DIET_FLAGS, dietRuleLine, emptyDiet, judgeDiet, readAiConsent, readDiet, writeAiConsent, writeDiet, type DietCode, type DietPrefs } from '@/lib/dietProfile';
 import { LANG_KEY, LANGS, languageName, readLang, translate, writeLang, type CopyKey, type Lang } from '@/lib/i18n';
 import { lookupOpenFoodFacts, OFF_CACHE_KEY, type OffProduct } from '@/lib/openFoodFacts';
-import { restoreFitBitePro, subscribeFitBitePro, type ProPlan } from '@/lib/billingService';
+import { readUserSubscription, restoreFitBitePro, subscribeFitBitePro, writeUserSubscription, type ProPlan } from '@/lib/billingService';
 import { QUOTA_STORAGE_KEY, canSpend, isProPlan, quotaLeft, spendQuota, type QuotaKind } from '@/lib/usageLimits';
 
 type FlowStep = 'welcome' | 'auth' | 'profile' | 'device' | 'app';
@@ -722,7 +722,12 @@ function sanitize(raw: unknown): Store | null {
     batteries,
     avatar: isAvatar(raw.avatar) ? raw.avatar : base.avatar,
     trialStartedAt,
-    proActive: raw.proActive === true,
+    proActive: (() => {
+      const subscription = readUserSubscription();
+      const active = raw.proActive === true || subscription.isPro;
+      if (active && !subscription.isPro) writeUserSubscription({ isPro: true, plan: subscription.plan ?? 'monthly' });
+      return active;
+    })(),
     plan: raw.plan === 'month' || raw.plan === 'year' ? raw.plan : null,
     paymentLabel: typeof raw.paymentLabel === 'string' ? raw.paymentLabel.slice(0, 40) : '',
     trialForcedExpired: raw.trialForcedExpired === true,
@@ -2114,7 +2119,8 @@ export default function Home() {
     sleepHrs: store.sleepHrs,
   });
 
-  const pro = isProPlan(store.proActive);
+  const isPro = isProPlan(store.proActive);
+  const pro = isPro;
   const t = (key: CopyKey) => translate(lang, key);
   const dietCodes = (input: { name: string; allergens?: string[]; analysis?: string[]; halal?: boolean | null; contains?: string[] }) => judgeDiet(diet, input);
   const blockForQuota = (kind: QuotaKind) => {
@@ -2415,6 +2421,7 @@ export default function Home() {
   };
 
   const openPro = () => {
+    if (isPro) return;
     setRestoreNote('');
     setShowPaywall(true);
   };
@@ -2810,7 +2817,7 @@ export default function Home() {
               {activeTab === 'today' ? (
                 <>
                   <p className="text-[13px] font-semibold text-muted">{greeting}</p>
-                  <h1 className="truncate text-[2rem] font-black tracking-[-0.045em]">{firstName}</h1>
+                  <h1 className="flex items-center gap-2 truncate text-[2rem] font-black tracking-[-0.045em]">{firstName}{isPro && <span className="on-gradient rounded-full bg-[#0f1115] px-2 py-0.5 text-[10px] font-extrabold tracking-[0.14em]">PRO</span>}</h1>
                 </>
               ) : (
                 <h1 className="truncate text-[1.65rem] font-black tracking-[-0.045em]">
@@ -3059,11 +3066,8 @@ export default function Home() {
                 const kind: QuotaKind = aiTab === 'kitchen' ? 'kitchen' : 'scan';
                 const usage = quotaLeft(kind, pro);
                 const word = kind === 'scan' ? 'scans' : 'recipes';
-                return pro ? (
-                  <div className="mb-3" key={quotaTick}>
-                    <div className="rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]">Unlimited AI*</div>
-                    <p className="mt-1 px-2 text-[10px] text-muted">*Fair-use limit: 50 scans/day</p>
-                  </div>
+                return isPro ? (
+                  <div className="mb-3 rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" key={quotaTick}>Unlimited</div>
                 ) : (
                   <button type="button" key={quotaTick} className="mb-3 flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" onClick={openPro}>
                     <span>{usage.left}/{usage.limit} free {word} left today</span>
@@ -3580,7 +3584,7 @@ export default function Home() {
             <section>
               <div className="card mb-4 flex items-center justify-between p-5">
                 <div className="min-w-0">
-                  <h2 className="truncate text-xl font-black tracking-[-0.03em]">{store.userName}</h2>
+                  <h2 className="flex items-center gap-2 truncate text-xl font-black tracking-[-0.03em]">{store.userName}{isPro && <span className="on-gradient rounded-full bg-[#0f1115] px-2 py-0.5 text-[10px] font-extrabold tracking-[0.14em]">PRO</span>}</h2>
                   <p className="mt-1 flex items-center gap-2 text-xs text-muted">
                     <span className="truncate">{emailOk(store.userEmail) ? store.userEmail : 'Add email in Profile'}</span>
                     {emailOk(store.userEmail) && <span className="rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#15803d]">Verified</span>}
@@ -3917,63 +3921,66 @@ export default function Home() {
             </div>
           )}
 
-          {showPaywall && (
-            <div className="fixed inset-0 z-50 grid place-items-end bg-black/55 px-3 pb-6 backdrop-blur-md sm:place-items-center" onClick={() => setShowPaywall(false)}>
-              <div className="obsidian-hero on-gradient max-h-[88dvh] w-full max-w-[390px] overflow-y-auto p-5" role="dialog" aria-modal="true" aria-labelledby="pay-title" onClick={(event) => event.stopPropagation()}>
+          {showPaywall && !isPro && (
+            <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/55 px-3 pb-6 backdrop-blur-md sm:items-center" onClick={() => setShowPaywall(false)}>
+              <div className="on-gradient relative z-[81] w-full max-w-[390px] rounded-[28px] border border-white/10 p-5" role="dialog" aria-modal="true" aria-labelledby="pay-title" style={{ overflowY: 'auto', maxHeight: '88dvh', background: 'linear-gradient(168deg, #171b24 0%, #0e1117 62%)', color: '#f4f6f8', boxShadow: '0 24px 50px rgba(8, 10, 16, 0.28)' }} onClick={(event) => event.stopPropagation()}>
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <p className="text-[10px] font-extrabold tracking-[0.16em] text-[#c4b5fd]">FITBITE PRO</p>
                     <h2 id="pay-title" className="mt-1 text-[1.65rem] font-black leading-tight tracking-[-0.04em]">Choose a plan</h2>
                   </div>
-                  <button type="button" className="grid h-9 w-9 place-items-center rounded-full text-lg" style={{ background: 'rgba(255,255,255,0.1)' }} aria-label="Close FitBite Pro" onClick={() => setShowPaywall(false)}>✕</button>
+                  <button type="button" className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-lg" style={{ background: 'rgba(255,255,255,0.1)', color: '#fff' }} aria-label="Close FitBite Pro" onClick={() => setShowPaywall(false)}>✕</button>
                 </div>
-                <div className="mt-4 grid gap-2">
-                  {([
-                    ['monthly', 'Monthly Plan', '$4.99 / month', ''],
-                    ['yearly', 'Yearly Plan', '$29.99 / year', 'Best Value · Save 50%'],
-                  ] as const).map(([id, name, price, badge]) => (
-                    <button key={id} type="button" className="rounded-2xl px-3 py-3 text-left" style={{ background: proPlan === id ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === id ? 'inset 0 0 0 1.5px #fff' : undefined }} onClick={() => setProPlan(id)}>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-sm font-extrabold">{name}</span>
-                        <span className="text-sm font-black">{price}</span>
-                      </div>
-                      {badge && <span className="mt-2 inline-flex rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#047857]">{badge}</span>}
-                    </button>
-                  ))}
+                <div className="mt-4 flex flex-col gap-3">
+                  <button type="button" aria-pressed={proPlan === 'monthly'} className="flex min-h-[76px] w-full items-center justify-between gap-3 rounded-2xl px-4 py-3 text-left" style={{ background: proPlan === 'monthly' ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === 'monthly' ? 'inset 0 0 0 2px #fff' : 'inset 0 0 0 1px rgba(255,255,255,0.16)', color: '#fff' }} onClick={() => setProPlan('monthly')}>
+                    <span className="text-sm font-extrabold">Monthly Plan</span>
+                    <span className="text-base font-black">$4.99/mo</span>
+                  </button>
+                  <button type="button" aria-pressed={proPlan === 'yearly'} className="flex min-h-[92px] w-full flex-col items-start justify-center gap-2 rounded-2xl px-4 py-3 text-left" style={{ background: proPlan === 'yearly' ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === 'yearly' ? 'inset 0 0 0 2px #fff' : 'inset 0 0 0 1px rgba(255,255,255,0.16)', color: '#fff' }} onClick={() => setProPlan('yearly')}>
+                    <span className="flex w-full items-center justify-between gap-3">
+                      <span className="text-sm font-extrabold">Yearly Plan</span>
+                      <span className="text-base font-black">$29.99/yr</span>
+                    </span>
+                    <span className="inline-flex rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#047857]">Best Value · Save 50%</span>
+                  </button>
                 </div>
-                <ul className="mt-4 space-y-2 text-sm leading-snug">
-                  {[
-                    'Basic AI Coach is Free',
-                    'Pro unlocks Unlimited AI Food Scans (50/day)',
-                    'Full AI Kitchen & Smart Swaps',
-                    'Body Progress Vision',
-                  ].map((line) => (
-                    <li key={line} className="rounded-2xl px-3 py-2" style={{ background: 'rgba(255,255,255,0.08)' }}>{line}</li>
-                  ))}
-                </ul>
                 <button
                   type="button"
-                  className="mt-4 h-12 w-full rounded-full bg-white text-sm font-extrabold text-[#0f1115]"
-                  onClick={() => {
+                  className="relative z-[2] mt-4 h-12 w-full rounded-full bg-white text-sm font-extrabold"
+                  style={{ color: '#0f1115', pointerEvents: 'auto' }}
+                  onClick={(event) => {
+                    event.stopPropagation();
                     void subscribeFitBitePro(proPlan).then((result) => {
                       if (!result.ok || !result.active) {
                         showToast('Google Play could not start the purchase');
                         return;
                       }
+                      writeUserSubscription({ isPro: true, plan: proPlan });
                       patch({ proActive: true });
-                      showToast(proPlan === 'yearly' ? 'Yearly plan active' : 'Monthly plan active');
+                      showToast('Welcome to FitBite Pro! 🎉');
                       setShowPaywall(false);
                     });
                   }}
                 >
-                  Subscribe via Google Play
+                  {pro ? 'Upgrade to Pro' : 'Subscribe Now'}
                 </button>
+                <ul className="mt-4 space-y-2 text-sm leading-snug">
+                  {[
+                    'Basic AI Coach is Free',
+                    'Pro unlocks Unlimited AI Food Scans',
+                    'Full AI Kitchen & Smart Swaps',
+                    'Body Progress Vision',
+                  ].map((line) => (
+                    <li key={line} className="rounded-2xl px-3 py-2" style={{ background: 'rgba(255,255,255,0.08)', color: '#f4f6f8' }}>{line}</li>
+                  ))}
+                </ul>
                 <button
                   type="button"
                   className="mt-3 w-full text-center text-xs font-semibold underline"
                   onClick={() => {
                     void restoreFitBitePro().then((result) => {
                       if (result.ok && result.active) {
+                        writeUserSubscription({ isPro: true, plan: result.plan ?? proPlan });
                         patch({ proActive: true });
                         if (result.plan) setProPlan(result.plan);
                         showToast('Purchase restored on this device');
