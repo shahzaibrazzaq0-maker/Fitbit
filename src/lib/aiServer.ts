@@ -3,6 +3,11 @@ import { parseScanNutrition } from '@/lib/aiEngine';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODELS = ['openai/gpt-4o-mini', 'anthropic/claude-3.5-sonnet'] as const;
 export const GEMINI_MODEL = 'gemini-3.5-flash-lite';
+const TEXT_MODELS = [
+  { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
+  { id: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' },
+  { id: GEMINI_MODEL, label: 'Gemini 3.5 Flash Lite' },
+] as const;
 const VISION_CHAIN = [
   { kind: 'gemini' as const, id: GEMINI_MODEL, label: 'Gemini 3.5 Flash Lite' },
   { kind: 'openrouter' as const, id: 'inclusionai/ling-3.2-flash:free', label: 'Ling 3.2 Vision' },
@@ -220,18 +225,22 @@ async function askPollinations(prompt: string, tokens: number) {
 
 export async function serverAsk(prompt: string, jpeg: string | undefined, tokens: number, temperature: number) {
   const { gemini, openrouter } = providerKeys();
+  if (gemini && !jpeg) {
+    const body = geminiBody([{ text: prompt }], tokens, temperature);
+    for (const model of TEXT_MODELS) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent?key=${encodeURIComponent(gemini)}`;
+      const text = await requestGemini(endpoint, body, AbortSignal.timeout(6000));
+      if (text) return { text, route: model.label };
+    }
+  }
   const primary = await askOpenRouter(prompt, jpeg, tokens, temperature, openrouter);
   if (primary.text) return { text: primary.text, route: primary.label };
-  if (gemini) {
-    const parts: ({ text: string } | { inlineData: { mimeType: 'image/jpeg'; data: string } })[] = [{ text: prompt }];
-    if (jpeg) parts.push({ inlineData: { mimeType: 'image/jpeg', data: jpeg } });
+  if (gemini && jpeg) {
+    const parts: ({ text: string } | { inlineData: { mimeType: 'image/jpeg'; data: string } })[] = [{ text: prompt }, { inlineData: { mimeType: 'image/jpeg', data: jpeg } }];
     const body = geminiBody(parts, tokens, temperature);
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(gemini)}`;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const text = await requestGemini(endpoint, body, AbortSignal.timeout(20000));
-      if (text) return { text, route: 'Gemini 3.5 Flash Lite' };
-      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 800));
-    }
+    const text = await requestGemini(endpoint, body, AbortSignal.timeout(12000));
+    if (text) return { text, route: 'Gemini 3.5 Flash Lite' };
   }
   if (jpeg) return { text: '', route: 'Unavailable' };
   try {

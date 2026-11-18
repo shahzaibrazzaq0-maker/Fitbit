@@ -190,15 +190,16 @@ function retryableAiError(message: string) {
   return /429|503|timeout|busy|high demand|rate limit|network|fetch/i.test(message);
 }
 
-async function postAi(body: Record<string, unknown>) {
+async function postAi(body: Record<string, unknown>, timeoutMs = 45000) {
   let last = 'network';
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const attempts = timeoutMs <= 8000 ? 1 : 2;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       const response = await fetch(aiEndpoint(), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(45000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       const raw = await response.text();
       if (!response.ok) {
@@ -247,7 +248,7 @@ export async function transcribeSpeech(audioBase64: string, mimeType: string) {
   }
 }
 
-export async function askNeural(prompt: string, jpeg: string | undefined, tokens: number, temperature: number) {
+export async function askNeural(prompt: string, jpeg: string | undefined, tokens: number, temperature: number, timeoutMs = 45000) {
   const cacheId = hashString(`${prompt}|${jpeg?.length ?? 0}|${jpeg?.slice(0, 48) ?? ''}`).toString(16);
   const cached = readAiCache(cacheId);
   if (cached) {
@@ -255,7 +256,7 @@ export async function askNeural(prompt: string, jpeg: string | undefined, tokens
     return cached;
   }
   try {
-    const data = await postAi({ op: 'ask', prompt, jpeg, tokens, temperature });
+    const data = await postAi({ op: 'ask', prompt, jpeg, tokens, temperature }, timeoutMs);
     if (data.text) {
       route = data.route || 'Gemini';
       writeAiCache(cacheId, data.text);

@@ -10,7 +10,7 @@ import { analyzeFoodPhoto, askNeural, engineRoute as readEngineRoute, lastAiWasB
 import { AI_CONSENT_KEY, DIET_KEY, DIET_FLAGS, dietRuleLine, emptyDiet, judgeDiet, readAiConsent, readDiet, writeAiConsent, writeDiet, type DietCode, type DietPrefs } from '@/lib/dietProfile';
 import { LANG_KEY, LANGS, languageName, readLang, translate, writeLang, type CopyKey, type Lang } from '@/lib/i18n';
 import { lookupOpenFoodFacts, OFF_CACHE_KEY, type OffProduct } from '@/lib/openFoodFacts';
-import { restoreFitBitePro } from '@/lib/billingService';
+import { restoreFitBitePro, subscribeFitBitePro, type ProPlan } from '@/lib/billingService';
 import { QUOTA_STORAGE_KEY, canSpend, isProPlan, quotaLeft, spendQuota, type QuotaKind } from '@/lib/usageLimits';
 
 type FlowStep = 'welcome' | 'auth' | 'profile' | 'device' | 'app';
@@ -1239,7 +1239,7 @@ function fileToJpeg(file: File) {
 }
 
 async function askGeminiText(prompt: string) {
-  const text = await askNeural(prompt, undefined, 160, 0.4);
+  const text = await askNeural(prompt, undefined, 160, 0.4, 8000);
   return text || localCoachFromPrompt(prompt);
 }
 
@@ -1707,6 +1707,7 @@ export default function Home() {
   const [scanNotice, setScanNotice] = useState('');
   const [scanPreview, setScanPreview] = useState<string | null>(null);
   const [showPaywall, setShowPaywall] = useState(false);
+  const [proPlan, setProPlan] = useState<ProPlan>('yearly');
   const [fairUseNote, setFairUseNote] = useState('');
   const [quotaTick, setQuotaTick] = useState(0);
   const [craving, setCraving] = useState('');
@@ -2264,8 +2265,8 @@ export default function Home() {
   const sendChat = (preset?: string) => {
     const text = (preset ?? chatInput).trim();
     if (!text || coachBusy) return;
-    if (blockForQuota('coach')) return;
     const ctx = coachContext();
+    const prompt = `${coachSystemPrompt(ctx)}\n\nUser: ${text}`;
     const userId = nextId();
     const aiId = nextId();
     setChatInput('');
@@ -2275,19 +2276,17 @@ export default function Home() {
       return { ...s, chat: [...s.chat, { id: userId, sender: 'user', text }, { id: aiId, sender: 'ai', text: 'Generating...' }] };
     });
     void (async () => {
-      let reply = '';
+      let reply = localCoachFromPrompt(prompt);
       try {
-        reply = await askGeminiText(`${coachSystemPrompt(ctx)}\n\nUser: ${text}`);
-        if (lastAiWasBillable()) {
-          spendQuota('coach', pro);
-          setQuotaTick((tick) => tick + 1);
-        }
+        reply = await askGeminiText(prompt);
       } catch {
-        reply = localCoachFromPrompt(`${coachSystemPrompt(ctx)}\n\nUser: ${text}`);
+        reply = localCoachFromPrompt(prompt);
+      } finally {
+        if (mounted.current) {
+          setStore((s) => ({ ...s, chat: s.chat.map((message) => (message.id === aiId ? { ...message, text: reply || localCoachFromPrompt(prompt) } : message)) }));
+          setCoachBusy(false);
+        }
       }
-      if (!mounted.current) return;
-      setStore((s) => ({ ...s, chat: s.chat.map((message) => (message.id === aiId ? { ...message, text: reply } : message)) }));
-      setCoachBusy(false);
     })();
   };
 
@@ -3188,9 +3187,12 @@ export default function Home() {
           {activeTab === 'ai' && (
             <section>
               {(() => {
-                const kind: QuotaKind = aiTab === 'kitchen' ? 'kitchen' : aiTab === 'coach' ? 'coach' : 'scan';
+                if (aiTab === 'coach') {
+                  return <div className="mb-3 rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]">AI Coach · Free</div>;
+                }
+                const kind: QuotaKind = aiTab === 'kitchen' ? 'kitchen' : 'scan';
                 const usage = quotaLeft(kind, pro);
-                const word = kind === 'scan' ? 'scans' : kind === 'coach' ? 'coach messages' : 'recipes';
+                const word = kind === 'scan' ? 'scans' : 'recipes';
                 return pro ? (
                   <div className="mb-3" key={quotaTick}>
                     <div className="rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]">Unlimited AI*</div>
@@ -3733,7 +3735,7 @@ export default function Home() {
                 </div>
               </div>
               <button type="button" className="mb-3 flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" onClick={openPro}>
-                <span>{pro ? 'FitBite Pro · Active' : 'FitBite Pro · Early Access'}</span>
+                <span>{pro ? 'FitBite Pro · Active' : 'FitBite Pro'}</span>
               </button>
               <div className="card mb-4 overflow-hidden">
                 {([
@@ -3916,7 +3918,7 @@ export default function Home() {
                     <p className="font-extrabold">{store.userEmail || 'No email yet'}</p>
                     {emailOk(store.userEmail) && <span className="inline-flex rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#047857]">Verified</span>}
                     <p className="text-muted">{store.session ? `${PROVIDERS[store.session.provider].label} session on this device` : 'Not signed in'}</p>
-                    <p className="text-muted">{pro ? 'FitBite Pro is active on this device.' : 'Early Access Active. Pro billing launches later through Google Play.'}</p>
+                    <p className="text-muted">{pro ? 'FitBite Pro is active on this device.' : 'Basic AI Coach is free. Upgrade for scans, kitchen, and progress vision.'}</p>
                     <button type="button" className={`${primaryClass} w-full`} onClick={() => { setDesk(null); openPro(); }}>FitBite Pro</button>
                     {!store.session && <button type="button" className={`${quietClass} w-full`} onClick={() => patch({ flowStep: 'auth' })}>Sign in / Register</button>}
                   </div>
@@ -4054,28 +4056,51 @@ export default function Home() {
               <div className="obsidian-hero on-gradient max-h-[88dvh] w-full max-w-[390px] overflow-y-auto p-5" role="dialog" aria-modal="true" aria-labelledby="pay-title" onClick={(event) => event.stopPropagation()}>
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <p className="text-[10px] font-extrabold tracking-[0.16em] text-[#c4b5fd]">FITBITE PRO · $4.99 / MONTH</p>
-                    <h2 id="pay-title" className="mt-1 text-[1.65rem] font-black leading-tight tracking-[-0.04em]">Early Access Active — Pro billing launching soon via Google Play</h2>
+                    <p className="text-[10px] font-extrabold tracking-[0.16em] text-[#c4b5fd]">FITBITE PRO</p>
+                    <h2 id="pay-title" className="mt-1 text-[1.65rem] font-black leading-tight tracking-[-0.04em]">Choose a plan</h2>
                   </div>
                   <button type="button" className="grid h-9 w-9 place-items-center rounded-full text-lg" style={{ background: 'rgba(255,255,255,0.1)' }} aria-label="Close FitBite Pro" onClick={() => setShowPaywall(false)}>✕</button>
                 </div>
+                <div className="mt-4 grid gap-2">
+                  {([
+                    ['monthly', 'Monthly Plan', '$4.99 / month', ''],
+                    ['yearly', 'Yearly Plan', '$29.99 / year', 'Best Value · Save 50%'],
+                  ] as const).map(([id, name, price, badge]) => (
+                    <button key={id} type="button" className="rounded-2xl px-3 py-3 text-left" style={{ background: proPlan === id ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === id ? 'inset 0 0 0 1.5px #fff' : undefined }} onClick={() => setProPlan(id)}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm font-extrabold">{name}</span>
+                        <span className="text-sm font-black">{price}</span>
+                      </div>
+                      {badge && <span className="mt-2 inline-flex rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#047857]">{badge}</span>}
+                    </button>
+                  ))}
+                </div>
                 <ul className="mt-4 space-y-2 text-sm leading-snug">
                   {[
-                    'Unlimited AI Food Scans* (50/day fair-use)',
-                    'AI Voice Coach & Persistent Memory',
+                    'Basic AI Coach is Free',
+                    'Pro unlocks Unlimited AI Food Scans (50/day)',
                     'Full AI Kitchen & Smart Swaps',
                     'Body Progress Vision',
                   ].map((line) => (
                     <li key={line} className="rounded-2xl px-3 py-2" style={{ background: 'rgba(255,255,255,0.08)' }}>{line}</li>
                   ))}
                 </ul>
-                <p className="mt-3 text-[10px] text-[#9aa3b2]">*Fair-use limit: 50 scans/day</p>
                 <button
                   type="button"
                   className="mt-4 h-12 w-full rounded-full bg-white text-sm font-extrabold text-[#0f1115]"
-                  onClick={() => setShowPaywall(false)}
+                  onClick={() => {
+                    void subscribeFitBitePro(proPlan).then((result) => {
+                      if (!result.ok || !result.active) {
+                        showToast('Google Play could not start the purchase');
+                        return;
+                      }
+                      patch({ proActive: true });
+                      showToast(proPlan === 'yearly' ? 'Yearly plan active' : 'Monthly plan active');
+                      setShowPaywall(false);
+                    });
+                  }}
                 >
-                  Continue Free
+                  Subscribe via Google Play
                 </button>
                 <button
                   type="button"
@@ -4083,21 +4108,27 @@ export default function Home() {
                   onClick={() => {
                     void restoreFitBitePro().then((result) => {
                       if (result.ok && result.active) {
+                        patch({ proActive: true });
+                        if (result.plan) setProPlan(result.plan);
                         showToast('Purchase restored on this device');
+                        setShowPaywall(false);
                         return;
                       }
-                      if (pro) {
-                        showToast('FitBite Pro is already active on this device');
-                        return;
-                      }
-                      setRestoreNote('No purchase to restore yet. Pro billing launches on Google Play.');
+                      setRestoreNote('No purchase to restore yet.');
                     });
                   }}
                 >
                   Restore Purchases
                 </button>
+                <button
+                  type="button"
+                  className="mt-3 h-11 w-full rounded-full text-sm font-extrabold"
+                  style={{ background: 'rgba(255,255,255,0.1)' }}
+                  onClick={() => setShowPaywall(false)}
+                >
+                  Continue with Free Plan
+                </button>
                 {restoreNote && <p className="mt-3 text-xs leading-relaxed text-[#d6d3d1]">{restoreNote}</p>}
-                <p className="mt-3 text-[10px] leading-relaxed text-[#9aa3b2]">Pro will be $4.99/month through Google Play, with a 50-scan daily fair-use cap, when billing opens. Nothing is charged in this build, and this screen does not collect a card.</p>
                 <p className="mt-2 text-[10px] leading-relaxed text-[#9aa3b2]">{t('disclaimer')}</p>
               </div>
             </div>
