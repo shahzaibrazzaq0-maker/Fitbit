@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">fitbite</string>
-    <string name="title_activity_main">fitbite</string>
-    <string name="package_name">com.example.app</string>
-    <string name="custom_url_scheme">com.example.app</string>
+    <string name="app_name">FitBite Pro</string>
+    <string name="title_activity_main">FitBite Pro</string>
+    <string name="package_name">com.fitbitepro.app</string>
+    <string name="custom_url_scheme">com.fitbitepro.app</string>
 </resources>
