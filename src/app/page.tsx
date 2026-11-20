@@ -35,6 +35,18 @@ interface MealItem {
   time: string;
 }
 
+function nutritionFromMeals(meals: MealItem[]) {
+  return meals.reduce(
+    (sum, meal) => ({
+      calories: sum.calories + meal.calories,
+      protein: sum.protein + meal.protein,
+      carbs: sum.carbs + meal.carbs,
+      fats: sum.fats + meal.fats,
+    }),
+    { calories: 0, protein: 0, carbs: 0, fats: 0 },
+  );
+}
+
 interface AiScanResult {
   name: string;
   calories: number;
@@ -76,6 +88,12 @@ interface ChatMessage {
   text: string;
 }
 
+const COACH_WELCOME = 'Ask me about training, food, or your next meal in any language.';
+
+function coachWelcome(): ChatMessage[] {
+  return [{ id: 1, sender: 'ai', text: COACH_WELCOME }];
+}
+
 interface WorkoutLog {
   id: number;
   sport: string;
@@ -98,6 +116,67 @@ interface CustomWatch {
   name: string;
   brand: string;
   battery: number;
+  mac?: string;
+}
+
+type BleDevice = { mac: string; name: string; rssi: number | null; bonded: boolean; hr: boolean; bleType: string };
+type BleLinkState = 'connecting' | 'connected' | 'live' | 'noHr' | 'classic' | 'disconnected';
+type BleLink = { mac: string; state: BleLinkState; reason?: string };
+type BleEvent =
+  | { type: 'status'; state: string }
+  | { type: 'device'; mac: string; name: string; rssi: number | null; bonded: boolean; hr: boolean; bleType: string }
+  | { type: 'connection'; state: BleLinkState; mac: string; name: string; reason?: string }
+  | { type: 'hr'; bpm: number; rr?: number[]; contact?: boolean }
+  | { type: 'battery'; level: number };
+type NativeBle = {
+  startScan?: () => void;
+  stopScan?: () => void;
+  connectWatch?: (mac: string, name: string) => void;
+  disconnectWatch?: () => void;
+  openBluetoothSettings?: () => void;
+  openLocationSettings?: () => void;
+  openAppSettings?: () => void;
+};
+
+const LAST_WATCH_KEY = 'fitbite_last_watch_v1';
+
+function nativeBle(): NativeBle | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const bridge = (window as Window & { FitBiteNative?: NativeBle }).FitBiteNative;
+  return bridge?.startScan ? bridge : undefined;
+}
+
+function readLastWatch(): { mac: string; name: string } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(LAST_WATCH_KEY) || 'null') as { mac?: unknown; name?: unknown } | null;
+    if (raw && typeof raw.mac === 'string' && typeof raw.name === 'string' && raw.mac) return { mac: raw.mac, name: raw.name };
+  } catch {
+    /* A damaged record means no quick reconnect. */
+  }
+  return null;
+}
+
+function signalBars(rssi: number | null) {
+  if (rssi === null) return 0;
+  return rssi >= -55 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : rssi >= -85 ? 1 : 0;
+}
+
+function bleReasonText(reason: string) {
+  switch (reason) {
+    case 'timeout': return 'The watch did not answer. Wake it, keep it close, then tap Reconnect.';
+    case 'gatt-133':
+    case 'service-discovery-failed':
+    case 'discovery-failed': return 'Bluetooth link failed. Tap Reconnect to try again.';
+    case 'link-lost': return 'Watch went out of range. Tap Reconnect when it is close.';
+    case 'bluetooth-off': return 'Bluetooth is off. Turn it on, then tap Reconnect.';
+    case 'bad-address': return 'That watch address is not valid. Scan to pair again.';
+    default: return 'Watch disconnected.';
+  }
+}
+
+function bleWatchId(mac: string) {
+  return `ble-${mac.replace(/[^0-9a-f]/gi, '').toLowerCase()}`;
 }
 
 type AvatarTheme = 'pulse' | 'aurora' | 'ember' | 'tide';
@@ -212,7 +291,7 @@ const CAL_GOAL = 2100;
 const STEP_GOAL = 10000;
 const WATER_GOAL = 3;
 const WELLNESS_NOTE = 'For general wellness and fitness tracking only — not a medical device. AI nutrition and Halal indicators are estimates; always verify product labels.';
-const SAFE_TOP = 'pt-[max(calc(env(safe-area-inset-top)+0.75rem),4.5rem)]';
+const SAFE_TOP = 'pt-[max(env(safe-area-inset-top),40px)]';
 
 const COACH_PROMPTS = [
   ['Desi High-Protein Dinner', 'Suggest one desi high-protein dinner that fits today. Three short lines.'],
@@ -303,12 +382,6 @@ const WATCHES: readonly { id: WatchId; name: string; model: string }[] = [
   { id: 'apple', name: 'BLE Smart Watch', model: 'Round face' },
   { id: 'samsung', name: 'Fitness Band', model: 'Band' },
   { id: 'huawei', name: 'Training Watch', model: 'Rectangular' },
-];
-
-const NEARBY_WATCHES: readonly { id: WatchId; label: string }[] = [
-  { id: 'apple', label: 'BLE Smart Watch' },
-  { id: 'samsung', label: 'Fitness Band' },
-  { id: 'huawei', label: 'Training Watch' },
 ];
 
 const LIFTS: readonly LiftName[] = ['Bench Press', 'Squat', 'Deadlift'];
@@ -492,10 +565,10 @@ function defaultStore(): Store {
     profileComplete: false,
     authProvider: null,
     session: null,
-    calories: 1180,
-    protein: 72,
-    carbs: 120,
-    fats: 38,
+    calories: 760,
+    protein: 64,
+    carbs: 56,
+    fats: 22,
     steps: 6840,
     waterL: 1.75,
     sleepHrs: 0,
@@ -513,7 +586,7 @@ function defaultStore(): Store {
       { id: 3, name: 'Oats' },
       { id: 4, name: 'Spinach' },
     ],
-    chat: [{ id: 1, sender: 'ai', text: 'Ask me about training, food, or your next meal in any language.' }],
+    chat: coachWelcome(),
     workouts: [],
     connectedWatch: null,
     customWatches: [],
@@ -603,6 +676,18 @@ function isAlert(v: unknown): v is WristAlert {
   return typeof v.id === 'number' && typeof v.device === 'string' && v.device.length > 0 && typeof v.text === 'string' && typeof v.at === 'string';
 }
 
+function uniqueAlerts(alerts: WristAlert[]) {
+  const seen = new Set<string>();
+  const next: WristAlert[] = [];
+  for (const alert of alerts) {
+    const key = `${alert.device}|${alert.at}|${alert.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(alert);
+  }
+  return next.slice(0, 8);
+}
+
 function isAvatar(v: unknown): v is AvatarTheme {
   return v === 'pulse' || v === 'aurora' || v === 'ember' || v === 'tide';
 }
@@ -615,7 +700,8 @@ function readCustomWatches(v: unknown): CustomWatch[] {
     const name = item.name.trim().slice(0, 40);
     const brand = item.brand.trim().slice(0, 40);
     if (!name || !brand) continue;
-    watches.push({ id: item.id.slice(0, 40), name, brand, battery: num(item.battery, 80, 1, 100) });
+    const mac = typeof item.mac === 'string' && /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/i.test(item.mac) ? item.mac.toUpperCase() : undefined;
+    watches.push({ id: item.id.slice(0, 40), name, brand, battery: num(item.battery, 80, 1, 100), ...(mac ? { mac } : {}) });
   }
   return watches.slice(0, 12);
 }
@@ -681,6 +767,17 @@ function sanitize(raw: unknown): Store | null {
       ? null
       : base.connectedWatch;
   const trialStartedAt = typeof raw.trialStartedAt === 'number' && Number.isFinite(raw.trialStartedAt) && raw.trialStartedAt > 0 ? raw.trialStartedAt : Date.now();
+  const meals = Array.isArray(raw.meals)
+    ? raw.meals.filter(isMeal).map((m) => ({
+      ...m,
+      name: m.name.slice(0, 80),
+      calories: num(m.calories, 0, 0, 5000),
+      protein: num(m.protein, 0, 0, 500),
+      carbs: num(m.carbs, 0, 0, 500),
+      fats: num(m.fats, 0, 0, 500),
+    }))
+    : base.meals;
+  const eaten = nutritionFromMeals(meals);
   return {
     flowStep,
     userName: typeof raw.userName === 'string' && raw.userName.trim() ? raw.userName.slice(0, 40) : base.userName,
@@ -693,10 +790,10 @@ function sanitize(raw: unknown): Store | null {
     profileComplete: typeof raw.profileComplete === 'boolean' ? raw.profileComplete : flowStep === 'app',
     authProvider: raw.authProvider === 'google' || raw.authProvider === 'apple' || raw.authProvider === 'huawei' ? raw.authProvider : null,
     session: readSession(raw.session),
-    calories: num(raw.calories, base.calories, 0, 20000),
-    protein: num(raw.protein, base.protein, 0, 2000),
-    carbs: num(raw.carbs, base.carbs, 0, 2000),
-    fats: num(raw.fats, base.fats, 0, 2000),
+    calories: eaten.calories,
+    protein: eaten.protein,
+    carbs: eaten.carbs,
+    fats: eaten.fats,
     steps: num(raw.steps, base.steps, 0, 200000),
     waterL: num(raw.waterL, base.waterL, 0, 20),
     sleepHrs: sleepHours(keptClock(raw.sleepBed), keptClock(raw.sleepWake)),
@@ -704,16 +801,7 @@ function sanitize(raw: unknown): Store | null {
     sleepWake: keptClock(raw.sleepWake),
     activeBurn: num(raw.activeBurn, base.activeBurn, 0, 20000),
     streak: num(raw.streak, base.streak, 0, 999),
-    meals: Array.isArray(raw.meals)
-      ? raw.meals.filter(isMeal).map((m) => ({
-        ...m,
-        name: m.name.slice(0, 80),
-        calories: num(m.calories, 0, 0, 5000),
-        protein: num(m.protein, 0, 0, 500),
-        carbs: num(m.carbs, 0, 0, 500),
-        fats: num(m.fats, 0, 0, 500),
-      }))
-      : base.meals,
+    meals,
     fridge: readFridge(raw.fridge ?? raw.fridgeItems, base.fridge),
     chat: Array.isArray(raw.chat) ? raw.chat.filter(isChat).slice(-40) : base.chat,
     workouts: Array.isArray(raw.workouts) ? raw.workouts.filter(isWorkout).slice(0, 12) : [],
@@ -731,9 +819,11 @@ function sanitize(raw: unknown): Store | null {
     plan: raw.plan === 'month' || raw.plan === 'year' ? raw.plan : null,
     paymentLabel: typeof raw.paymentLabel === 'string' ? raw.paymentLabel.slice(0, 40) : '',
     trialForcedExpired: raw.trialForcedExpired === true,
-    wristAlerts: Array.isArray(raw.wristAlerts)
-      ? raw.wristAlerts.filter(isAlert).slice(0, 8).map((alert) => ({ ...alert, text: alert.text.replace(/\d+(?:\.\d+)?\s*BPM/gi, '-- BPM') }))
-      : [],
+    wristAlerts: uniqueAlerts(
+      Array.isArray(raw.wristAlerts)
+        ? raw.wristAlerts.filter(isAlert).map((alert) => ({ ...alert, text: alert.text.replace(/\d+(?:\.\d+)?\s*BPM/gi, '-- BPM') }))
+        : [],
+    ),
     isFasting: raw.isFasting === true && typeof raw.fastingStartedAt === 'number' && Number.isFinite(raw.fastingStartedAt) && raw.fastingStartedAt > 0,
     fastingStartedAt: typeof raw.fastingStartedAt === 'number' && Number.isFinite(raw.fastingStartedAt) && raw.fastingStartedAt > 0 ? raw.fastingStartedAt : null,
     fastingSec: 0,
@@ -1451,64 +1541,52 @@ function MusicHub() {
   }, []);
 
   return (
-    <div className="card mt-4 p-3.5">
-      <h2 className="text-sm font-black tracking-[-0.03em]">Phone Music</h2>
-      <div className="mt-3 flex items-center gap-2.5">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-extrabold">{track?.name ?? 'Music library'}</div>
-          <div className="truncate text-[11px] text-muted">{track ? 'From your phone music library' : 'Open the music app or choose a track'}</div>
-        </div>
-        <button
-          type="button"
-          className="grid h-10 w-10 place-items-center rounded-full bg-slate-900 text-xs font-black on-gradient disabled:opacity-40"
-          aria-label={playing ? 'Pause phone music' : 'Play phone music'}
-          disabled={!track}
-          onClick={() => {
-            const audio = phoneAudio.current;
-            if (!audio || !track) return;
-            if (playing) {
-              audio.pause();
-              setPlaying(false);
-            } else {
-              void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
-            }
-          }}
-        >
-          {playing ? '❚❚' : '▶'}
-        </button>
-      </div>
-      <div className="mt-3 grid gap-2">
-        <button type="button" className={primaryClass} onClick={() => nativeMusic()?.openPhoneMusicApp?.()}>Phone Music</button>
-        <button type="button" className={quietClass} onClick={() => nativeMusic()?.pickAudioTrack?.()}>Choose a track</button>
-        <button type="button" className={quietClass} onClick={openSpotifyApp}>Open Spotify</button>
-      </div>
+    <div className="card mt-4 flex items-center gap-2 p-2">
+      <button type="button" className="shrink-0 rounded-full bg-slate-900 px-3 py-2 text-[11px] font-extrabold on-gradient" onClick={() => nativeMusic()?.openPhoneMusicApp?.()}>Phone Music</button>
+      <button type="button" className="shrink-0 rounded-full bg-slate-100 px-3 py-2 text-[11px] font-extrabold text-slate-700" onClick={() => nativeMusic()?.pickAudioTrack?.()}>Pick Track</button>
+      <button type="button" className="shrink-0 rounded-full bg-slate-100 px-3 py-2 text-[11px] font-extrabold text-slate-700" onClick={openSpotifyApp}>Spotify</button>
+      <button
+        type="button"
+        className="ml-auto grid h-9 w-9 shrink-0 place-items-center rounded-full bg-slate-900 text-xs font-black on-gradient disabled:opacity-40"
+        aria-label={playing ? 'Pause phone music' : 'Play phone music'}
+        disabled={!track}
+        onClick={() => {
+          const audio = phoneAudio.current;
+          if (!audio || !track) return;
+          if (playing) {
+            audio.pause();
+            setPlaying(false);
+          } else {
+            void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+          }
+        }}
+      >
+        {playing ? '❚❚' : '▶'}
+      </button>
     </div>
   );
 }
 
 function WatchFace({ kind, bpm, alert, compact = false, live = true }: { kind: WatchId | 'custom'; bpm: number | null; alert: string | null; compact?: boolean; live?: boolean }) {
   return (
-    <div className={`relative grid shrink-0 place-items-center ${compact ? 'h-16 w-16' : 'h-[132px] w-[132px]'}`}>
+    <div className={`relative grid shrink-0 place-items-center overflow-hidden ${compact ? 'h-16 w-16' : 'h-[132px] w-[132px]'}`}>
       {kind === 'apple' && (
         <svg viewBox="0 0 120 120" className="h-full w-full">
-          <rect x="28" y="8" width="64" height="18" rx="6" fill="#2a2a2e" />
-          <rect x="28" y="94" width="64" height="18" rx="6" fill="#2a2a2e" />
-          <rect x="18" y="18" width="84" height="84" rx="22" fill="#111114" stroke="rgba(255,255,255,0.28)" />
-          <circle cx="60" cy="60" r="24" fill="none" stroke="#ff375f" strokeWidth="5" strokeDasharray="100 160" strokeLinecap="round" />
-          <circle cx="60" cy="60" r="16" fill="none" stroke="#30d158" strokeWidth="5" strokeDasharray="70 120" strokeLinecap="round" />
-          <circle cx="60" cy="60" r="8" fill="none" stroke="#64d2ff" strokeWidth="5" />
-          <rect x="102" y="42" width="6" height="16" rx="2" fill="#d7d7dc" />
+          <rect x="52" y="6" width="16" height="14" rx="4" fill="#2a2a2e" />
+          <rect x="52" y="100" width="16" height="14" rx="4" fill="#2a2a2e" />
+          <circle cx="60" cy="60" r="46" fill="#1b2438" stroke="#ff375f" strokeWidth="6" />
+          <circle cx="60" cy="60" r="34" fill="#0d1424" stroke="rgba(255,255,255,0.12)" />
+          <path d="M60 36v24l14 8" fill="none" stroke="#ff9f0a" strokeWidth="3" strokeLinecap="round" />
+          <circle cx="60" cy="60" r="3" fill="#ffd60a" />
         </svg>
       )}
       {kind === 'samsung' && (
         <svg viewBox="0 0 120 120" className="h-full w-full">
-          <circle cx="60" cy="60" r="46" fill="#1b2438" stroke="#ff9f0a" strokeWidth="6" />
-          <circle cx="60" cy="60" r="34" fill="#0d1424" stroke="rgba(255,255,255,0.12)" />
-          <path d="M60 36v24l14 8" fill="none" stroke="#ff9f0a" strokeWidth="3" strokeLinecap="round" />
-          <circle cx="60" cy="60" r="3" fill="#ffd60a" />
-          {[0, 45, 90, 135].map((deg) => (
-            <rect key={deg} x="58" y="20" width="4" height="8" rx="1" fill="#ffd60a" transform={`rotate(${deg} 60 60)`} />
-          ))}
+          <rect x="8" y="40" width="104" height="40" rx="14" fill="#111114" stroke="#38bdf8" strokeWidth="4" />
+          <rect x="18" y="48" width="68" height="24" rx="8" fill="#0b1220" />
+          <text x="52" y="64" textAnchor="middle" fill="#f8fafc" fontSize="11" fontFamily="inherit">{live && bpm !== null ? bpm : '--'}</text>
+          <rect x="92" y="52" width="10" height="16" rx="3" fill="#22c55e" />
+          <rect x="4" y="50" width="6" height="20" rx="2" fill="#64748b" />
         </svg>
       )}
       {kind === 'custom' && (
@@ -1520,24 +1598,18 @@ function WatchFace({ kind, bpm, alert, compact = false, live = true }: { kind: W
       )}
       {kind === 'huawei' && (
         <svg viewBox="0 0 120 120" className="h-full w-full">
-          <circle cx="60" cy="60" r="46" fill="#14110c" stroke="#e6c27a" strokeWidth="5" />
-          <circle cx="60" cy="60" r="36" fill="#07140f" />
-          <path d="M24 64c10-14 18-8 24 0s14 14 24 0 16-16 28-4" fill="none" stroke="#30d158" strokeWidth="3" strokeLinecap="round" />
-          <text x="60" y="52" textAnchor="middle" fill="#e6c27a" fontSize="11" fontFamily="inherit">
-            BLE
-          </text>
-          <text x="60" y="86" textAnchor="middle" fill="#f5f5f7" fontSize="13" fontFamily="inherit">
-            {live && bpm !== null ? bpm : '--'}
-          </text>
+          <rect x="34" y="10" width="52" height="100" rx="16" fill="#14110c" stroke="#e6c27a" strokeWidth="4" />
+          <rect x="40" y="22" width="40" height="62" rx="8" fill="#07140f" />
+          <text x="60" y="58" textAnchor="middle" fill="#f5f5f7" fontSize="13" fontFamily="inherit">{live && bpm !== null ? bpm : '--'}</text>
         </svg>
       )}
-      {kind !== 'huawei' && (
+      {kind !== 'huawei' && kind !== 'samsung' && (
         <div className="on-gradient absolute text-center">
           <div className="text-[18px] font-black tabular-nums leading-none">{live && bpm !== null ? bpm : '--'}</div>
           <div className="text-[8px] font-bold tracking-[0.14em] opacity-70">BPM</div>
         </div>
       )}
-      {alert && <span className="toast-in absolute top-1 right-1 h-2.5 w-2.5 rounded-full bg-[#ff375f] ring-2 ring-black" />}
+      {alert && <span className="absolute top-[22%] right-[28%] h-2.5 w-2.5 rounded-full bg-[#ff375f] ring-2 ring-white" />}
     </div>
   );
 }
@@ -1615,11 +1687,13 @@ export default function Home() {
   const [recipe, setRecipe] = useState<KitchenRecipe | null>(null);
   const [chatInput, setChatInput] = useState('');
   const [challenge, setChallenge] = useState<SavedChallenge | null>(null);
+  const [challengeOpen, setChallengeOpen] = useState(false);
   const [selectedSport, setSelectedSport] = useState<string | null>(null);
   const [showGps, setShowGps] = useState(false);
-  const [pairOpen, setPairOpen] = useState(false);
-  const [pairHint, setPairHint] = useState<WatchId | null>(null);
-  const [pairingId, setPairingId] = useState<WatchId | null>(null);
+  const [bleState, setBleState] = useState('idle');
+  const [bleDevices, setBleDevices] = useState<BleDevice[]>([]);
+  const [bleLink, setBleLink] = useState<BleLink | null>(null);
+  const [lastWatch, setLastWatch] = useState<{ mac: string; name: string } | null>(null);
   const [workoutOn, setWorkoutOn] = useState(false);
   const [workoutSec, setWorkoutSec] = useState(0);
   const [gpsLabel, setGpsLabel] = useState('GPS route active');
@@ -1639,7 +1713,10 @@ export default function Home() {
   const [fuelLive, setFuelLive] = useState<{ key: string; pre: FuelPlate; post: FuelPlate } | null>(null);
   const [fuelBusy, setFuelBusy] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pairTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bleHandler = useRef<(event: BleEvent) => void>(() => undefined);
+  const pairedMac = useRef('');
+  const rrWindow = useRef<number[]>([]);
+  const storeRef = useRef<Store>(defaultStore());
   const savedRaw = useRef('');
   const idRef = useRef(0);
   const mounted = useRef(true);
@@ -1687,13 +1764,14 @@ export default function Home() {
     window.localStorage.removeItem(LANG_KEY);
     window.localStorage.removeItem(AI_CONSENT_KEY);
     window.localStorage.removeItem(OFF_CACHE_KEY);
+    window.localStorage.removeItem(LAST_WATCH_KEY);
+    nativeBle()?.disconnectWatch?.();
     window.location.reload();
   };
 
   const backState = useRef({
     showPaywall: false,
     desk: null as typeof desk,
-    pairOpen: false,
     scanOpen: false,
     showGps: false,
     sleepOpen: false,
@@ -1703,7 +1781,7 @@ export default function Home() {
     flowStep: store.flowStep,
     activeTab,
   });
-  backState.current = { showPaywall, desk, pairOpen, scanOpen, showGps, sleepOpen, showMealLog, showDeleteConfirm, barcodeOpen, flowStep: store.flowStep, activeTab };
+  backState.current = { showPaywall, desk, scanOpen, showGps, sleepOpen, showMealLog, showDeleteConfirm, barcodeOpen, flowStep: store.flowStep, activeTab };
 
   useEffect(() => {
     if (!Capacitor.isNativePlatform()) return;
@@ -1713,7 +1791,6 @@ export default function Home() {
       if (snap.showDeleteConfirm) { setShowDeleteConfirm(false); return; }
       if (snap.showPaywall) { setShowPaywall(false); return; }
       if (snap.desk) { setDesk(null); return; }
-      if (snap.pairOpen) { setPairOpen(false); return; }
       if (snap.scanOpen) { setScanOpen(false); return; }
       if (snap.showGps) { setShowGps(false); return; }
       if (snap.sleepOpen) { setSleepOpen(false); return; }
@@ -1729,7 +1806,28 @@ export default function Home() {
     setLang(readLang());
     setDiet(readDiet());
     setAiConsent(readAiConsent());
+    setLastWatch(readLastWatch());
   }, []);
+
+  useEffect(() => {
+    const bridge = window as Window & { fitbiteBle?: (json: string) => void };
+    bridge.fitbiteBle = (json: string) => {
+      try {
+        bleHandler.current(JSON.parse(json) as BleEvent);
+      } catch {
+        /* Ignore malformed native events. */
+      }
+    };
+    return () => {
+      delete bridge.fitbiteBle;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (scanOpen) return;
+    nativeBle()?.stopScan?.();
+    setBleState((state) => (state === 'scanning' ? 'idle' : state));
+  }, [scanOpen]);
 
   useEffect(() => {
     mounted.current = true;
@@ -1754,7 +1852,6 @@ export default function Home() {
     return () => {
       mounted.current = false;
       if (toastTimer.current) clearTimeout(toastTimer.current);
-      if (pairTimer.current) clearTimeout(pairTimer.current);
     };
   }, []);
 
@@ -2087,14 +2184,8 @@ export default function Home() {
     };
     setStore((s) => {
       if (s.meals.some((existing) => existing.id === meal.id)) return s;
-      return {
-        ...s,
-        meals: [meal, ...s.meals],
-        calories: s.calories + meal.calories,
-        protein: s.protein + meal.protein,
-        carbs: s.carbs + meal.carbs,
-        fats: s.fats + meal.fats,
-      };
+      const meals = [meal, ...s.meals];
+      return { ...s, meals, ...nutritionFromMeals(meals) };
     });
     setAiResult(null);
     setFoodQuery('');
@@ -2103,16 +2194,17 @@ export default function Home() {
     showToast(`Logged ${meal.name} · +${meal.calories} kcal`);
   };
 
+  const eaten = nutritionFromMeals(store.meals);
   const coachContext = (): CoachContext => ({
     name: store.userName,
     gender: store.gender,
     weightKg: store.weightKg,
     heightCm: store.heightCm,
     age: ageOf(store.birthday),
-    calories: store.calories,
-    protein: store.protein,
-    carbs: store.carbs,
-    fats: store.fats,
+    calories: eaten.calories,
+    protein: eaten.protein,
+    carbs: eaten.carbs,
+    fats: eaten.fats,
     steps: store.steps,
     waterL: store.waterL,
     burned: store.activeBurn,
@@ -2132,6 +2224,12 @@ export default function Home() {
     setFairUseNote('');
     setShowPaywall(true);
     return true;
+  };
+
+  const clearChat = () => {
+    setCoachBusy(false);
+    setChatInput('');
+    patch({ chat: coachWelcome() });
   };
 
   const sendChat = (preset?: string) => {
@@ -2308,14 +2406,10 @@ export default function Home() {
   };
 
   const removeMeal = (meal: MealItem) => {
-    setStore((s) => ({
-      ...s,
-      meals: s.meals.filter((item) => item.id !== meal.id),
-      calories: Math.max(0, s.calories - meal.calories),
-      protein: Math.max(0, s.protein - meal.protein),
-      carbs: Math.max(0, s.carbs - meal.carbs),
-      fats: Math.max(0, s.fats - meal.fats),
-    }));
+    setStore((s) => {
+      const meals = s.meals.filter((item) => item.id !== meal.id);
+      return { ...s, meals, ...nutritionFromMeals(meals) };
+    });
   };
 
   const addWater = () => {
@@ -2340,19 +2434,22 @@ export default function Home() {
     showToast('Water reset to 0.00 L');
   };
 
-  const pairDiscoveredWatch = (name: string, brand: string) => {
+  const pairDiscoveredWatch = (name: string, brand: string, mac?: string) => {
     const clean = name.trim().slice(0, 40);
     if (!clean) {
       showToast('Enter a watch name');
       return;
     }
-    const id = `bt-${hashString(`${clean}-${brand}`).toString(16)}`;
+    const id = mac ? bleWatchId(mac) : `bt-${hashString(`${clean}-${brand}`).toString(16)}`;
     setStore((s) => {
-      const existing = s.customWatches.find((watch) => watch.name.toLowerCase() === clean.toLowerCase());
-      const watch = existing ?? { id, name: clean, brand, battery: 80 };
+      const existing = s.customWatches.find((watch) => watch.id === id)
+        ?? s.customWatches.find((watch) => !watch.mac && watch.name.toLowerCase() === clean.toLowerCase());
+      const watch: CustomWatch = existing
+        ? { ...existing, ...(mac ? { mac } : {}) }
+        : { id, name: clean, brand, battery: 80, ...(mac ? { mac } : {}) };
       return {
         ...s,
-        customWatches: existing ? s.customWatches : [watch, ...s.customWatches].slice(0, 12),
+        customWatches: existing ? s.customWatches.map((item) => (item.id === existing.id ? watch : item)) : [watch, ...s.customWatches].slice(0, 12),
         connectedWatch: watch.id,
       };
     });
@@ -2361,26 +2458,148 @@ export default function Home() {
     showToast(`✓ Paired ${clean}`);
   };
 
+  const applyHeartRate = (bpm: number, rr: number[] = []) => {
+    setHeartRate(bpm);
+    setBpmSamples((samples) => [...samples, bpm].slice(-8));
+    if (rr.length > 0) rrWindow.current = [...rrWindow.current, ...rr].slice(-30);
+    const gaps = rrWindow.current;
+    if (gaps.length > 1) {
+      let sum = 0;
+      for (let index = 1; index < gaps.length; index += 1) sum += (gaps[index] - gaps[index - 1]) ** 2;
+      setHrvMs(Math.round(Math.sqrt(sum / (gaps.length - 1))));
+    }
+  };
+
   const readHeartPacket = (view: DataView) => {
     const flags = view.getUint8(0);
     const bpm = flags & 0x01 ? view.getUint16(1, true) : view.getUint8(1);
     if (bpm < 30 || bpm > 230) return;
-    setHeartRate(bpm);
-    setBpmSamples((samples) => [...samples, bpm].slice(-8));
     let offset = flags & 0x01 ? 3 : 2;
     if (flags & 0x08) offset += 2;
-    if ((flags & 0x10) && offset + 3 < view.byteLength) {
-      const gaps: number[] = [];
+    const rr: number[] = [];
+    if (flags & 0x10) {
       while (offset + 1 < view.byteLength) {
-        gaps.push(view.getUint16(offset, true) / 1024);
+        rr.push(Math.round((view.getUint16(offset, true) * 1000) / 1024));
         offset += 2;
       }
-      if (gaps.length > 1) {
-        let sum = 0;
-        for (let index = 1; index < gaps.length; index += 1) sum += (gaps[index] - gaps[index - 1]) ** 2;
-        setHrvMs(Math.round(Math.sqrt(sum / (gaps.length - 1)) * 1000));
-      }
     }
+    applyHeartRate(bpm, rr);
+  };
+
+  storeRef.current = store;
+  bleHandler.current = (event: BleEvent) => {
+    if (event.type === 'status') {
+      setBleState(event.state);
+      return;
+    }
+    if (event.type === 'device') {
+      setBleDevices((rows) => {
+        const prev = rows.find((row) => row.mac === event.mac);
+        const next: BleDevice = {
+          mac: event.mac,
+          name: event.name || prev?.name || 'Bluetooth device',
+          rssi: event.rssi ?? prev?.rssi ?? null,
+          bonded: event.bonded || prev?.bonded === true,
+          hr: event.hr || prev?.hr === true,
+          bleType: event.bleType,
+        };
+        return [...rows.filter((row) => row.mac !== event.mac), next]
+          .sort((a, b) => Number(b.bonded) - Number(a.bonded) || (b.rssi ?? -200) - (a.rssi ?? -200))
+          .slice(0, 40);
+      });
+      return;
+    }
+    if (event.type === 'hr') {
+      if (event.contact === false || event.bpm <= 0) {
+        setHeartRate(null);
+        return;
+      }
+      applyHeartRate(event.bpm, event.rr);
+      return;
+    }
+    if (event.type === 'battery') {
+      const level = Math.max(1, Math.min(100, Math.round(event.level)));
+      setStore((s) => ({ ...s, customWatches: s.customWatches.map((watch) => (watch.mac && watch.mac === pairedMac.current ? { ...watch, battery: level } : watch)) }));
+      return;
+    }
+    setBleLink({ mac: event.mac, state: event.state, reason: event.reason });
+    if (event.state === 'disconnected') {
+      pairedMac.current = '';
+      setHeartRate(null);
+      setHrvMs(null);
+      rrWindow.current = [];
+      if (event.reason && event.reason !== 'user') showToast(bleReasonText(event.reason));
+      return;
+    }
+    if (event.state === 'connecting' || !event.mac || pairedMac.current === event.mac) return;
+    pairedMac.current = event.mac;
+    const name = event.name || 'Bluetooth watch';
+    try {
+      window.localStorage.setItem(LAST_WATCH_KEY, JSON.stringify({ mac: event.mac, name }));
+    } catch {
+      /* Quick reconnect is a convenience only. */
+    }
+    setLastWatch({ mac: event.mac, name });
+    const known = storeRef.current.customWatches.find((watch) => watch.mac === event.mac);
+    if (known) {
+      setStore((s) => ({ ...s, connectedWatch: known.id }));
+      setScanOpen(false);
+      showToast(`✓ Connected ${known.name}`);
+      return;
+    }
+    pairDiscoveredWatch(name, 'Bluetooth LE', event.mac);
+  };
+
+  const reconnectWatch = (watch: { name: string; mac?: string }) => {
+    const native = nativeBle();
+    if (native?.connectWatch && watch.mac) {
+      setBleLink({ mac: watch.mac, state: 'connecting' });
+      native.connectWatch(watch.mac, watch.name);
+      return;
+    }
+    void scanAnyWatch();
+  };
+
+  const disconnectWatchNow = (watch: { mac?: string }) => {
+    const native = nativeBle();
+    if (native?.disconnectWatch && watch.mac) {
+      native.disconnectWatch();
+      setBleLink({ mac: watch.mac, state: 'disconnected', reason: 'user' });
+    } else {
+      patch({ connectedWatch: null });
+    }
+    pairedMac.current = '';
+    rrWindow.current = [];
+    setHeartRate(null);
+    setHrvMs(null);
+  };
+
+  const forgetWatch = (watchId: string) => {
+    const watch = store.customWatches.find((item) => item.id === watchId);
+    if (watch?.mac) {
+      if (bleLink?.mac === watch.mac) nativeBle()?.disconnectWatch?.();
+      if (readLastWatch()?.mac === watch.mac) {
+        window.localStorage.removeItem(LAST_WATCH_KEY);
+        setLastWatch(null);
+      }
+      setBleLink((link) => (link?.mac === watch.mac ? null : link));
+    }
+    setStore((s) => ({
+      ...s,
+      customWatches: s.customWatches.filter((item) => item.id !== watchId),
+      connectedWatch: s.connectedWatch === watchId ? null : s.connectedWatch,
+      wristAlerts: s.wristAlerts.filter((alert) => alert.device !== watchId),
+    }));
+    pairedMac.current = '';
+    rrWindow.current = [];
+    setHeartRate(null);
+    setHrvMs(null);
+    showToast('Watch removed from this phone');
+  };
+
+  const connectScanned = (device: BleDevice) => {
+    setBleLink({ mac: device.mac, state: 'connecting' });
+    nativeBle()?.connectWatch?.(device.mac, device.name);
   };
 
   const listenToHeart = async (device: { gatt?: { connect: () => Promise<{ getPrimaryService: (service: string) => Promise<{ getCharacteristic: (name: string) => Promise<{ startNotifications: () => Promise<void>; addEventListener: (type: string, listener: (event: Event) => void) => void }> }> }> } | null; addEventListener: (type: string, listener: () => void) => void }) => {
@@ -2401,6 +2620,14 @@ export default function Home() {
   };
 
   const scanAnyWatch = async () => {
+    const native = nativeBle();
+    if (native?.startScan) {
+      setBleDevices([]);
+      setBleState('scanning');
+      setScanOpen(true);
+      native.startScan();
+      return;
+    }
     const bluetooth = (navigator as Navigator & { bluetooth?: { requestDevice: (options: { acceptAllDevices: boolean; optionalServices?: string[] }) => Promise<{ name?: string | null; gatt?: { connect: () => Promise<{ getPrimaryService: (service: string) => Promise<{ getCharacteristic: (name: string) => Promise<{ startNotifications: () => Promise<void>; addEventListener: (type: string, listener: (event: Event) => void) => void }> }> }> } | null; addEventListener: (type: string, listener: () => void) => void }> } }).bluetooth;
     if (!bluetooth?.requestDevice) {
       setScanOpen(true);
@@ -2422,6 +2649,13 @@ export default function Home() {
 
   const openPro = () => {
     if (isPro) return;
+    setRestoreNote('');
+    setShowPaywall(true);
+  };
+
+  const openSubscription = () => {
+    const saved = readUserSubscription();
+    if (saved.plan) setProPlan(saved.plan);
     setRestoreNote('');
     setShowPaywall(true);
   };
@@ -2508,32 +2742,6 @@ export default function Home() {
     showToast(`Saved ${sport} · ${formatDistance(stats.distanceKm)} · ${Math.round(stats.calories)} kcal`);
   };
 
-  const openPairing = (id?: WatchId) => {
-    if (pairTimer.current) {
-      clearTimeout(pairTimer.current);
-      pairTimer.current = null;
-    }
-    setPairingId(null);
-    setPairHint(id ?? null);
-    setPairOpen(true);
-  };
-
-  const closePairing = () => {
-    if (pairingId) return;
-    if (pairTimer.current) {
-      clearTimeout(pairTimer.current);
-      pairTimer.current = null;
-    }
-    setPairOpen(false);
-  };
-
-  const connectWatch = (id: WatchId) => {
-    if (pairingId) return;
-    setPairHint(id);
-    setPairOpen(false);
-    void scanAnyWatch();
-  };
-
   const sendWrist = () => {
     if (!store.connectedWatch) {
       showToast('Pair a watch first');
@@ -2543,7 +2751,10 @@ export default function Home() {
     const watch = WATCHES.find((item) => item.id === device) ?? store.customWatches.find((item) => item.id === device);
     const text = `${heartRate ?? '--'} BPM · ${store.steps.toLocaleString()} steps · ${store.waterL.toFixed(2)} L`;
     const alert: WristAlert = { id: nextId(), device, text, at: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) };
-    setStore((s) => (s.wristAlerts.some((item) => item.id === alert.id) ? s : { ...s, wristAlerts: [alert, ...s.wristAlerts].slice(0, 8) }));
+    setStore((s) => {
+      if (s.wristAlerts.some((item) => item.device === alert.device && item.text === alert.text && item.at === alert.at)) return s;
+      return { ...s, wristAlerts: uniqueAlerts([alert, ...s.wristAlerts]) };
+    });
     showToast(`Alert sent to ${watch?.name ?? 'watch'}`);
   };
 
@@ -2557,7 +2768,10 @@ export default function Home() {
   const postPlate = fuelLive?.key === fuelKey ? fuelLive.post : localPost;
 
   useEffect(() => {
-    if (!hydrated || activeTab !== 'sport' || !canSpend('kitchen', pro)) return;
+    if (!hydrated || activeTab !== 'sport' || !canSpend('kitchen', pro)) {
+      setFuelBusy(false);
+      return;
+    }
     const goal = store.trainingGoal;
     const focus = store.sessionFocus;
     const weight = store.weightKg;
@@ -2607,10 +2821,19 @@ export default function Home() {
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
   const firstName = store.userName.trim().split(/\s+/)[0] || 'there';
-  const kcalLeft = Math.max(0, CAL_GOAL - store.calories);
+  const kcalLeft = Math.max(0, CAL_GOAL - eaten.calories);
   const fastingElapsed = store.isFasting && store.fastingStartedAt ? Math.max(0, Math.floor((nowTick - store.fastingStartedAt) / 1000)) : 0;
   const loggedSleep = sleepHours(store.sleepBed, store.sleepWake);
   const watchStreaming = heartRate !== null;
+  const rescan = () => void scanAnyWatch();
+  const bleNotice: { text: string; actions: { label: string; run: () => void }[] } | null =
+    bleState === 'needs-permission' ? { text: 'Allow Nearby devices in the Android prompt so FitBite can find your watch.', actions: [{ label: 'Allow & scan', run: rescan }] }
+    : bleState === 'permission-denied' ? { text: 'Bluetooth permission is off. Open app settings and allow Nearby devices (Location on Android 11 and older), then scan again.', actions: [{ label: 'Open app settings', run: () => nativeBle()?.openAppSettings?.() }, { label: 'Try again', run: rescan }] }
+    : bleState === 'bluetooth-off' ? { text: 'Bluetooth is off. Turn it on to find your watch.', actions: [{ label: 'Turn on Bluetooth', run: rescan }, { label: 'Bluetooth settings', run: () => nativeBle()?.openBluetoothSettings?.() }] }
+    : bleState === 'location-off' ? { text: 'Android 11 and older need Location switched on for Bluetooth scanning. FitBite does not store your location.', actions: [{ label: 'Location settings', run: () => nativeBle()?.openLocationSettings?.() }, { label: 'Try again', run: rescan }] }
+    : bleState === 'unsupported' ? { text: 'This phone does not support Bluetooth Low Energy.', actions: [] }
+    : bleState === 'scan-failed' ? { text: 'The scan could not start. Switch Bluetooth off and on, then try again.', actions: [{ label: 'Try again', run: rescan }] }
+    : null;
 
   if (!hydrated) return <main className="min-h-dvh bg-[#F5F6F8]" />;
 
@@ -2629,10 +2852,10 @@ export default function Home() {
   }
 
   return (
-    <main className={`relative mx-auto min-h-dvh w-full max-w-[430px] bg-[#F5F6F8] ${SAFE_TOP} ${store.flowStep === 'app' ? `px-5 ${workoutOn && activeTab !== 'sport' ? 'pb-[max(12rem,calc(env(safe-area-inset-bottom)+10rem))]' : 'pb-[max(9.5rem,calc(env(safe-area-inset-bottom)+8.5rem))]'}` : ''}`}>
+    <main className={`relative mx-auto min-h-dvh w-full max-w-[430px] bg-[#F5F6F8] ${store.flowStep === 'app' ? 'px-5' : SAFE_TOP}`}>
       {store.flowStep === 'app' && <div className="ambient-aurora" aria-hidden="true" />}
       {toast && (
-        <div role="status" aria-live="polite" className="toast-in on-gradient fixed left-1/2 z-[80] w-[min(380px,calc(100%-32px))] -translate-x-1/2 rounded-full bg-[#0F1115] px-4 py-3 text-center text-sm font-extrabold shadow-[0_12px_35px_rgba(15,17,21,0.22)]" style={{ top: 'max(calc(env(safe-area-inset-top) + 0.75rem), 4.5rem)' }}>
+        <div role="status" aria-live="polite" className="toast-in on-gradient fixed left-1/2 z-[80] w-[min(380px,calc(100%-32px))] -translate-x-1/2 rounded-full bg-[#0F1115] px-4 py-3 text-center text-sm font-extrabold shadow-[0_12px_35px_rgba(15,17,21,0.22)]" style={{ top: 'max(calc(env(safe-area-inset-top) + 8px), 48px)' }}>
           {toast}
         </div>
       )}
@@ -2812,7 +3035,7 @@ export default function Home() {
 
       {store.flowStep === 'app' && (
         <>
-          <header className="lux-rise relative z-10 mb-5 flex items-center justify-between gap-3">
+          <header className="safe-top-bar lux-rise sticky top-0 z-30 -mx-5 mb-5 flex items-center justify-between gap-3 px-5 pb-3">
             <div className="min-w-0">
               {activeTab === 'today' ? (
                 <>
@@ -2837,21 +3060,21 @@ export default function Home() {
           </header>
 
           {activeTab === 'today' && (
-            <section className="lux-stage">
+            <section className="lux-stage tab-scroll">
               <div className="obsidian-hero px-5 py-7">
                 <div className="relative grid place-items-center">
-                  <ActivityRings calories={store.calories} steps={store.steps} water={store.waterL} draw={drawRings} night />
+                  <ActivityRings calories={eaten.calories} steps={store.steps} water={store.waterL} draw={drawRings} night />
                   <div className="pointer-events-none absolute w-[62px] text-center">
                     <div className="text-[26px] leading-none font-black tabular-nums tracking-[-0.05em]">{kcalLeft}</div>
-                    <div className="mt-1 text-[8px] leading-tight font-bold tracking-[0.12em] text-muted uppercase">{store.calories >= CAL_GOAL ? 'Goal met' : 'kcal left'}</div>
+                    <div className="mt-1 text-[8px] leading-tight font-bold tracking-[0.12em] text-muted uppercase">{eaten.calories >= CAL_GOAL ? 'Goal met' : 'kcal left'}</div>
                   </div>
                 </div>
                 <p className="sr-only">
-                  Calories {store.calories} of {CAL_GOAL}. Steps {store.steps} of {STEP_GOAL}. Water {store.waterL} liters of {WATER_GOAL}.
+                  Calories {eaten.calories} of {CAL_GOAL}. Steps {store.steps} of {STEP_GOAL}. Water {store.waterL} liters of {WATER_GOAL}.
                 </p>
                 <div className="mt-2 grid grid-cols-3 gap-2 text-center">
                   {[
-                    { label: t('calories'), color: '#ff2d55', value: store.calories.toLocaleString(), goal: CAL_GOAL.toLocaleString() },
+                    { label: t('calories'), color: '#ff2d55', value: eaten.calories.toLocaleString(), goal: CAL_GOAL.toLocaleString() },
                     { label: t('steps'), color: '#22c55e', value: store.steps.toLocaleString(), goal: STEP_GOAL.toLocaleString() },
                     { label: t('water'), color: '#0ea5e9', value: `${store.waterL.toFixed(2)} L`, goal: '3.00 L' },
                   ].map((item) => (
@@ -2916,9 +3139,9 @@ export default function Home() {
                 </div>
                 <div className="grid grid-cols-3 gap-2">
                   {[
-                    { label: t('protein'), value: store.protein, goal: 150, color: '#ff2d55' },
-                    { label: t('carbs'), value: store.carbs, goal: 220, color: '#f59e0b' },
-                    { label: t('fat'), value: store.fats, goal: 75, color: '#22c55e' },
+                    { label: t('protein'), value: eaten.protein, goal: 150, color: '#ff2d55' },
+                    { label: t('carbs'), value: eaten.carbs, goal: 220, color: '#f59e0b' },
+                    { label: t('fat'), value: eaten.fats, goal: 75, color: '#22c55e' },
                   ].map((macro) => (
                     <div key={macro.label} className="glass-quiet rounded-2xl px-2.5 py-3">
                       <div className="text-[11px] font-extrabold" style={{ color: macro.color }}>{macro.label}</div>
@@ -2955,7 +3178,7 @@ export default function Home() {
           )}
 
           {activeTab === 'health' && (
-            <section>
+            <section className="tab-scroll">
               <div className="grid grid-cols-2 gap-3">
                 <button type="button" className="card p-3.5 text-left" onClick={() => setActiveTab('me')}>
                   <div className="flex items-center justify-between gap-2">
@@ -3058,7 +3281,7 @@ export default function Home() {
           )}
 
           {activeTab === 'ai' && (
-            <section>
+            <section className="tab-scroll">
               {(() => {
                 if (aiTab === 'coach') {
                   return <div className="mb-3 rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]">AI Coach · Free</div>;
@@ -3076,7 +3299,13 @@ export default function Home() {
               })()}
               {fairUseNote && <p className="mb-3 px-1 text-xs font-semibold text-slate-700">{fairUseNote}</p>}
               {challenge && (
-                <article className="obsidian-hero on-gradient mb-3 px-4 py-3.5">
+                <div className="mb-3">
+                  <button type="button" className="flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" aria-expanded={challengeOpen} onClick={() => setChallengeOpen((open) => !open)}>
+                    <span className="truncate">Today's AI Challenge{challenge.completed ? ' · Done' : ''}</span>
+                    <span className="shrink-0 text-muted">{challengeOpen ? 'Hide' : 'Show'}</span>
+                  </button>
+                {challengeOpen && (
+                <article className="obsidian-hero on-gradient mt-2 px-4 py-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="rounded-full px-2.5 py-1 text-[10px] font-extrabold tracking-[0.08em]" style={{ background: 'rgba(255,255,255,0.1)' }}>Today's AI Challenge</span>
                     <span className="shrink-0 text-[10px] font-extrabold tracking-wide text-[#c4b5fd]">{store.streak} day streak</span>
@@ -3112,6 +3341,8 @@ export default function Home() {
                     </button>
                   </div>
                 </article>
+                )}
+                </div>
               )}
               <div className="card-quiet mb-4 grid grid-cols-3 rounded-full p-1 text-[11px] font-extrabold">
                 {([
@@ -3124,7 +3355,7 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-              <div className="mb-3 flex gap-1.5 overflow-x-auto pb-1">
+              <div className="chip-row mb-3">
                 <button type="button" className="shrink-0 rounded-full bg-white px-3 py-1.5 text-[11px] font-extrabold shadow-sm" onClick={() => { const next = LANGS[(LANGS.indexOf(lang) + 1) % LANGS.length]; setLang(next); writeLang(next); }}>{lang.toUpperCase()}</button>
                 {DIET_FLAGS.map((flag) => (
                   <button key={flag} type="button" className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-extrabold ${diet[flag] ? 'bg-[#dcfce7] text-[#047857]' : 'bg-white text-slate-600 shadow-sm'}`} onClick={() => setDiet((current) => { const next = { ...current, [flag]: !current[flag] }; writeDiet(next); return next; })}>
@@ -3132,13 +3363,11 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-              <p className="mb-4 px-1 text-[11px] leading-relaxed text-muted">{t('disclaimer')}</p>
-
               {aiTab === 'kitchen' && (
                 <div className="card p-5">
                   <h3 className="font-black tracking-[-0.03em]">Fridge</h3>
                   <p className="mt-1 text-xs text-muted">Live recipes from the fridge.</p>
-                  <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+                  <div className="chip-row mt-3">
                     {CRAVINGS.map((item) => (
                       <button key={item} type="button" className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-extrabold ${craving === item ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-700'}`} onClick={() => { setCraving(item); generateRecipe(item); }}>
                         {item}
@@ -3225,19 +3454,15 @@ export default function Home() {
                 <div className="card p-5">
                   <h3 className="font-black tracking-[-0.03em]">AI Scan</h3>
                   <p className="mt-1 text-xs text-muted">The phone camera opens, then the photo lands in this frame.</p>
-                  <p className="mt-2 text-[11px] leading-relaxed text-muted">{t('disclaimer')}</p>
-                  <div className="mt-3 grid grid-cols-2 gap-2 text-xs font-extrabold">
-                    <button type="button" className={`inline-flex h-11 items-center justify-center gap-1.5 rounded-full ${scanMode === 'photo' ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-700'}`} onClick={() => { setScanMode('photo'); cameraInputRef.current?.click(); }}><Glyph name="camera" /> Snap Food Photo</button>
-                    <button type="button" className={`h-11 rounded-full ${scanMode === 'barcode' ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-700'}`} onClick={() => { setScanMode('barcode'); setBarcodeOpen(true); }}>{t('barcode')}</button>
-                  </div>
                   <div className="relative mt-3 aspect-[4/3] overflow-hidden rounded-[28px] bg-[#f4f7fb] shadow-[inset_0_0_0_1px_rgba(15,23,42,0.06)]">
                     {scanPreview ? <img src={scanPreview} alt="Selected food" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center px-8 text-center text-sm text-muted">A crisp preview appears the moment you take or pick a photo.</div>}
                     <div className="pointer-events-none absolute inset-4 rounded-[22px] border border-white/80 shadow-[0_0_0_1px_rgba(16,185,129,0.35)]" />
                   </div>
-                  <div className="mt-3 grid grid-cols-2 gap-2">
-                    <button type="button" className={primaryClass} disabled={scanBusy} onClick={() => cameraInputRef.current?.click()}>{scanBusy ? 'Analyzing...' : 'Take Photo & Analyze'}</button>
-                    <button type="button" className={quietClass} disabled={scanBusy} onClick={() => galleryInputRef.current?.click()}><Glyph name="image" /> Select from Gallery</button>
+                  <div className="mt-3 flex gap-2">
+                    <button type="button" className={`${primaryClass} min-w-0 flex-1`} disabled={scanBusy} onClick={() => { setScanMode('photo'); cameraInputRef.current?.click(); }}><Glyph name="camera" />{scanBusy ? 'Analyzing...' : 'Take Food Photo'}</button>
+                    <button type="button" className={quietClass} disabled={scanBusy} onClick={() => { setScanMode('photo'); galleryInputRef.current?.click(); }}><Glyph name="image" />Gallery</button>
                   </div>
+                  <button type="button" className={`mt-2 h-9 rounded-full px-4 text-xs font-extrabold ${scanMode === 'barcode' ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-700'}`} onClick={() => { setScanMode('barcode'); setBarcodeOpen(true); }}>Barcode</button>
                   <input ref={cameraInputRef} className="hidden" type="file" accept="image/*" capture="environment" onChange={(event) => { onPickScanPhoto(event.target.files?.[0], scanMode === 'barcode'); event.target.value = ''; }} />
                   <input ref={galleryInputRef} className="hidden" type="file" accept="image/*" onChange={(event) => { onPickScanPhoto(event.target.files?.[0], scanMode === 'barcode'); event.target.value = ''; }} />
                   {scanMode === 'barcode' && (
@@ -3250,7 +3475,7 @@ export default function Home() {
                     </div>
                   )}
                   <div className="mt-3 flex gap-2">
-                    <input className={fieldClass} value={scanNote} maxLength={160} placeholder="Optional note, or speak the meal" onChange={(event) => setScanNote(event.target.value)} />
+                    <input className={fieldClass} value={scanNote} maxLength={160} placeholder="Add note or tap mic..." onChange={(event) => setScanNote(event.target.value)} />
                     <MicButton hot={voiceFor === 'scan'} phase={voicePhase} label="Dictate a meal" disabled={voiceFor !== null && voiceFor !== 'scan'} onClick={() => dictate('scan', setScanNote)} />
                   </div>
                   {voiceFor === 'scan' && voiceNote && <p className="mt-2 text-sm font-semibold text-slate-700">{voiceNote}</p>}
@@ -3362,9 +3587,18 @@ export default function Home() {
 
               {aiTab === 'coach' && (
                 <div className="card p-5">
-                  <div className="mb-4">
-                    <h3 className="font-black tracking-[-0.03em]">AI Coach</h3>
-                    <p className="text-xs text-muted">Live coach</p>
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-black tracking-[-0.03em]">AI Coach</h3>
+                      <p className="text-xs text-muted">Live coach</p>
+                    </div>
+                    <button type="button" aria-label="Clear Chat" className="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-semibold text-muted" onClick={clearChat}>
+                      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                        <path d="M4 12a8 8 0 1 0 2.3-5.6" strokeLinecap="round" />
+                        <path d="M4 4v4h4" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      Clear Chat
+                    </button>
                   </div>
                   <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
                     {COACH_PROMPTS.map(([label, prompt]) => (
@@ -3393,11 +3627,12 @@ export default function Home() {
                   {voiceFor === 'coach' && voiceNote && <p className="mt-2 text-sm font-semibold text-slate-700">{voiceNote}</p>}
                 </div>
               )}
+              <p className="mt-4 px-1 text-[11px] leading-relaxed text-muted">{t('disclaimer')}</p>
             </section>
           )}
 
           {activeTab === 'sport' && (
-            <section>
+            <section className="tab-scroll">
               <p className="mb-3 text-sm text-muted">{store.gpsAllowed ? 'Location allowed on this device.' : 'Location is requested each time you start.'}</p>
               <div className="grid grid-cols-2 gap-3">
                 {[
@@ -3470,7 +3705,7 @@ export default function Home() {
                   <p className="mt-2 text-xs leading-relaxed text-muted">{postPlate.why}</p>
                 </div>
                 <button type="button" className={`${quietClass} mt-3 w-full`} disabled={fuelBusy} onClick={() => { if (blockForQuota('kitchen')) return; setPlateCursor((n) => n + 1); }}>
-                  {fuelBusy ? 'Building your plates...' : 'Another plate'}
+                  {fuelBusy ? 'Building your plates...' : 'Regenerate Meal Plan'}
                 </button>
               </div>
 
@@ -3494,7 +3729,10 @@ export default function Home() {
                     <input className={`${fieldClass} mt-1`} inputMode="numeric" value={liftReps} onChange={(e) => setLiftReps(e.target.value)} />
                   </label>
                 </div>
-                <div className="mt-3 text-3xl font-black tabular-nums tracking-[-0.04em]">{previewRm ?? '—'}<span className="ml-1 text-sm font-semibold text-muted">kg 1RM</span></div>
+                <div className="mt-3 flex items-center gap-2">
+                  <span className="text-3xl font-black tabular-nums tracking-[-0.04em]">{previewRm ?? '—'} kg</span>
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-extrabold tracking-[0.14em] text-muted">1RM</span>
+                </div>
                 <button type="button" className={`${primaryClass} mt-3 w-full`} onClick={saveLift}>Save set</button>
                 <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                   {bestLifts.map((item) => (
@@ -3581,7 +3819,7 @@ export default function Home() {
           )}
 
           {activeTab === 'me' && (
-            <section>
+            <section className="tab-scroll">
               <div className="card mb-4 flex items-center justify-between p-5">
                 <div className="min-w-0">
                   <h2 className="flex items-center gap-2 truncate text-xl font-black tracking-[-0.03em]">{store.userName}{isPro && <span className="on-gradient rounded-full bg-[#0f1115] px-2 py-0.5 text-[10px] font-extrabold tracking-[0.14em]">PRO</span>}</h2>
@@ -3598,23 +3836,24 @@ export default function Home() {
               </div>
               <div className="card-quiet mb-3 p-3">
                 <p className="text-[11px] font-bold tracking-[0.14em] text-muted">{t('language')}</p>
-                <div className="mt-2 flex gap-1.5 overflow-x-auto">
+                <div className="chip-row mt-2">
                   {LANGS.map((code) => (
                     <button key={code} type="button" className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-extrabold ${lang === code ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-600'}`} onClick={() => { setLang(code); writeLang(code); }}>{languageName(code)}</button>
                   ))}
                 </div>
               </div>
-              <button type="button" className="mb-3 flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" onClick={openPro}>
+              <button type="button" className="mb-3 flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" onClick={openSubscription}>
                 <span>{pro ? 'FitBite Pro · Active' : 'FitBite Pro'}</span>
+                <span className="text-muted">Plans</span>
               </button>
               <div className="card mb-4 overflow-hidden">
                 {([
-                  ['account', 'Sign in / Register & Cloud Sync', 'cloud'],
-                  ['body', 'Personal Information & Body Profile', 'user'],
-                  ['alerts', 'Smart Message & Wrist Notifications', 'bell'],
-                  ['sensor', 'Run App in Background & Sensor Guard', 'activity'],
-                  ['privacy', 'GDPR Privacy & Data Control', 'shield'],
-                  ['feedback', 'VIP Feedback & Concierge Support', 'message'],
+                  ['account', 'Account & Cloud Sync', 'cloud'],
+                  ['body', 'Body Profile', 'user'],
+                  ['alerts', 'Wrist Notifications & Alerts', 'bell'],
+                  ['sensor', 'Background Sensors', 'activity'],
+                  ['privacy', 'Privacy & Data', 'shield'],
+                  ['feedback', 'VIP Support', 'message'],
                   ['update', 'App Update & System Diagnostics', 'download'],
                   ['about', 'About FitBite Pro', 'info'],
                 ] as const).map(([id, label, icon]) => (
@@ -3622,7 +3861,7 @@ export default function Home() {
                     <span className="on-gradient grid h-9 w-9 shrink-0 place-items-center rounded-2xl bg-[#0F1115]">
                       <DeskIcon name={icon} />
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-sm font-extrabold tracking-[-0.02em]">{id === 'privacy' ? t('privacy') : label}</span>
+                    <span className="min-w-0 flex-1 text-sm font-extrabold tracking-[-0.02em]">{label}</span>
                     <span className="text-muted">›</span>
                   </button>
                 ))}
@@ -3637,56 +3876,86 @@ export default function Home() {
               </button>
               {[
                 ...WATCHES.map((watch) => ({ id: watch.id, name: watch.name, model: watch.model, battery: store.batteries[watch.id], custom: false as const })),
-                ...store.customWatches.map((watch) => ({ id: watch.id, name: watch.name, model: watch.brand, battery: watch.battery, custom: true as const })),
+                ...store.customWatches.map((watch) => ({ id: watch.id, name: watch.name, model: watch.brand, battery: watch.battery, custom: true as const, mac: watch.mac })),
               ].sort((a, b) => (a.id === store.connectedWatch ? -1 : b.id === store.connectedWatch ? 1 : 0)).map((watch) => {
+                const mac = 'mac' in watch ? watch.mac : undefined;
+                const native = Boolean(nativeBle() && mac);
+                const link = mac && bleLink?.mac === mac ? bleLink : null;
                 const connected = store.connectedWatch === watch.id;
+                const active = native ? Boolean(link && link.state !== 'disconnected') : connected;
+                const paired = connected || watch.custom;
+                const live = active && (native ? link?.state === 'live' : true) && watchStreaming;
                 const alert = store.wristAlerts.find((item) => item.device === watch.id);
+                const badge = native
+                  ? link?.state === 'connecting' ? 'Connecting…'
+                    : link?.state === 'connected' ? 'Connected · Setting up'
+                    : link?.state === 'live' ? 'Connected · Live BLE'
+                    : link?.state === 'noHr' ? (link.reason === 'no-0x180d' ? 'Connected · Watch uses proprietary HR protocol' : 'Connected · No heart-rate stream')
+                    : link?.state === 'classic' ? 'Connected · Classic Only'
+                    : 'Disconnected'
+                  : connected ? (watchStreaming ? 'Connected · Live BLE' : 'Paired · waiting for heart rate')
+                  : paired ? 'Disconnected' : 'Not paired';
+                const detail = native && link?.state === 'noHr' && link.reason === 'no-0x180d' ? 'Wrist notifications and step tracking keep working.'
+                  : native && link?.state === 'noHr' ? 'Heart-rate stream could not start. Tap Disconnect, then Reconnect.'
+                  : native && link?.state === 'classic' ? 'Classic Bluetooth only: notifications and steps work, live BPM needs BLE'
+                  : native && link?.state === 'live' && !watchStreaming ? 'Waiting for a heart-rate reading. Keep the watch snug on your wrist.'
+                  : native && !active && link?.reason && link.reason !== 'user' ? bleReasonText(link.reason)
+                  : null;
                 return (
                   <article
                     key={watch.id}
-                    className={`relative mb-4 cursor-pointer overflow-hidden p-5 text-left ${connected ? 'card' : 'card-quiet'}`}
-                    onClick={() => void scanAnyWatch()}
+                    className={`relative mb-4 overflow-hidden p-5 text-left ${active ? 'card' : 'card-quiet'}`}
                   >
                     <div className={`pointer-events-none absolute -top-10 -left-6 h-28 w-28 rounded-full blur-2xl ${watch.id === 'apple' ? 'bg-[#ff375f]/25' : watch.id === 'samsung' ? 'bg-[#f59e0b]/25' : 'bg-[#22c55e]/25'}`} />
                     <div className="relative z-10 flex items-center gap-3">
-                      <WatchFace kind={watch.custom ? 'custom' : (watch.id as WatchId)} bpm={heartRate} alert={connected ? alert?.text ?? null : null} live={connected} />
+                      <WatchFace kind={watch.custom ? 'custom' : (watch.id as WatchId)} bpm={active ? heartRate : null} alert={active ? alert?.text ?? null : null} live={active} />
                       <div className="min-w-0 flex-1">
                         <div className="text-[11px] font-bold tracking-[0.16em] text-muted">{watch.model.toUpperCase()}</div>
                         <div className="truncate text-lg font-black tracking-[-0.03em]">{watch.name}</div>
-                        {connected && watchStreaming ? (
+                        {live ? (
                           <>
                             <div className="mt-1 flex items-center gap-1.5 text-xs font-extrabold text-[#16a34a]">
                               <span className="relative flex h-2 w-2">
                                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#22c55e] opacity-70" />
                                 <span className="relative h-2 w-2 rounded-full bg-[#22c55e]" />
                               </span>
-                              Live
+                              {badge}
                             </div>
                             <div className="mt-2 flex items-center gap-2 text-sm">
                               <span className="font-semibold tabular-nums">{heartRate}</span>
                               <span className="text-muted">BPM</span>
                             </div>
                           </>
-                        ) : connected ? (
-                          <>
-                            <div className="mt-1 text-xs font-extrabold text-muted">Paired · no heart-rate packet</div>
-                            <div className="mt-2 text-sm font-semibold tabular-nums">-- BPM</div>
-                          </>
                         ) : (
                           <>
-                            <div className="mt-1 text-xs font-extrabold text-muted">Not paired</div>
+                            <div className={`mt-1 text-xs font-extrabold ${active ? 'text-[#16a34a]' : 'text-muted'}`}>{badge}</div>
                             <div className="mt-2 text-sm font-semibold tabular-nums">-- BPM</div>
-                            <p className="mt-1 text-[11px] leading-snug text-muted">Tap Pair to sync live biometrics</p>
+                            {detail ? (
+                              <p className="mt-1 text-[11px] leading-snug text-muted">{detail}</p>
+                            ) : !paired ? (
+                              <p className="mt-1 text-[11px] leading-snug text-muted">Tap Pair to sync live biometrics</p>
+                            ) : null}
                           </>
                         )}
                       </div>
                     </div>
-                    {connected ? (
-                      <button type="button" className={`${primaryClass} mt-4 w-full`} onClick={(event) => { event.stopPropagation(); sendWrist(); }}>
-                        Send wrist notification
-                      </button>
+                    {active ? (
+                      <>
+                        <button type="button" className={`${primaryClass} mt-4 w-full`} onClick={sendWrist}>
+                          Send wrist notification
+                        </button>
+                        <div className="mt-2 grid grid-cols-2 gap-2">
+                          <button type="button" className={`${quietClass} h-10 text-xs`} onClick={() => disconnectWatchNow({ mac })}>Disconnect</button>
+                          <button type="button" className={`${quietClass} h-10 text-xs`} onClick={() => forgetWatch(watch.id)}>Forget</button>
+                        </div>
+                      </>
+                    ) : paired ? (
+                      <div className="mt-4 grid grid-cols-2 gap-2">
+                        <button type="button" className={`${primaryClass} h-11 text-sm`} onClick={() => reconnectWatch({ name: watch.name, mac })}>Reconnect</button>
+                        <button type="button" className={`${quietClass} h-11 text-sm`} onClick={() => forgetWatch(watch.id)}>Forget</button>
+                      </div>
                     ) : (
-                      <button type="button" className={`${quietClass} mt-4 w-full`} onClick={(event) => { event.stopPropagation(); void scanAnyWatch(); }}>
+                      <button type="button" className={`${quietClass} mt-4 w-full`} onClick={() => void scanAnyWatch()}>
                         Pair
                       </button>
                     )}
@@ -3697,7 +3966,7 @@ export default function Home() {
               {store.wristAlerts.length > 0 && (
                 <div className="card-quiet mb-4 p-5">
                   <h3 className="text-sm font-semibold">Wrist alerts</h3>
-                  {store.wristAlerts.map((alert) => (
+                  {uniqueAlerts(store.wristAlerts).map((alert) => (
                     <div key={alert.id} className="mt-3 border-t border-white/10 pt-3 text-xs text-white/60">
                       <span className="text-white/80">{alert.at}</span> · {(WATCHES.find((watch) => watch.id === alert.device) ?? store.customWatches.find((watch) => watch.id === alert.device))?.name} · {alert.text}
                     </div>
@@ -3708,7 +3977,6 @@ export default function Home() {
               <div className="card-quiet mb-4 space-y-2 p-5 text-sm">
                 <a className="block font-extrabold underline" href={APP_LEGAL_URLS.privacy} {...legalTarget(APP_LEGAL_URLS.privacy)}>Privacy Policy</a>
                 <a className="block font-extrabold underline" href={APP_LEGAL_URLS.terms} {...legalTarget(APP_LEGAL_URLS.terms)}>Terms of Use</a>
-                <p className="text-[11px] leading-relaxed text-muted">Set APP_LEGAL_URLS at the top of capacitor.config.ts to your hosted HTTPS pages before Play Console upload.</p>
               </div>
               <div className="card mb-4 p-5">
                 <h3 className="text-sm font-black">Delete Account & Erase All Local Data</h3>
@@ -3719,59 +3987,6 @@ export default function Home() {
                 Sign out
               </button>
             </section>
-          )}
-
-          {pairOpen && (
-            <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 px-5 backdrop-blur-md" onClick={closePairing}>
-              <div className="bt-modal card w-full max-w-[360px] p-6" role="dialog" aria-modal="true" aria-labelledby="pair-title" onClick={(event) => event.stopPropagation()}>
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h2 id="pair-title" className="text-xl font-black tracking-[-0.03em]">Bluetooth</h2>
-                    <p className="mt-1 text-sm text-white/55">Scanning for nearby smartwatches...</p>
-                  </div>
-                  <button type="button" className="grid h-9 w-9 place-items-center rounded-full text-lg text-slate-400" aria-label="Close pairing" disabled={Boolean(pairingId)} onClick={closePairing}>
-                    ✕
-                  </button>
-                </div>
-                <div className="relative mx-auto mt-5 grid h-28 w-28 place-items-center" aria-hidden="true">
-                  <span className="bt-ring absolute inset-1 rounded-full border-2 border-[#60a5fa]" />
-                  <span className="bt-ring bt-ring-late absolute inset-1 rounded-full border-2 border-[#818cf8]" />
-                  <span className="absolute inset-7 rounded-full bg-[#eef4ff]" />
-                  <svg viewBox="0 0 24 24" className="relative h-7 w-7 text-[#2563eb]" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M7 7l10 10-5 5V2l5 5L7 17" />
-                  </svg>
-                </div>
-                <div className="mt-5 space-y-2">
-                  {[...NEARBY_WATCHES].sort((a, b) => (a.id === pairHint ? -1 : b.id === pairHint ? 1 : 0)).map((device, index) => {
-                    const busy = pairingId === device.id;
-                    const linked = store.connectedWatch === device.id;
-                    return (
-                      <div key={device.id} className="toast-in flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-3" style={{ animationDelay: `${index * 90}ms` }}>
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-extrabold tracking-[-0.02em]">{device.label}</div>
-                          {linked && <div className="mt-0.5 text-[11px] font-extrabold text-[#16a34a]">Paired</div>}
-                        </div>
-                        <button
-                          type="button"
-                          className={`${primaryClass} h-9 shrink-0 px-4 text-xs`}
-                          disabled={Boolean(pairingId)}
-                          onClick={() => connectWatch(device.id)}
-                        >
-                          {busy ? (
-                            <>
-                              <span className="bt-spin h-3.5 w-3.5 rounded-full border-2 border-white/40 border-t-white" />
-                              Pairing
-                            </>
-                          ) : (
-                            'Connect'
-                          )}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
           )}
 
           {desk && (
@@ -3899,7 +4114,6 @@ export default function Home() {
                     <p>Coach, Kitchen, and Scan run through the on-device app. Meals and messages stay on this phone.</p>
                     <p>{t('disclaimer')}</p>
                     <p>Security: optional AES-256-GCM local vault and a SHA-256 PIN. No card data is collected.</p>
-                    <p className="text-xs text-muted">Privacy and terms links below use a placeholder. Replace them with your hosted URLs before Play submission.</p>
                   </div>
                 )}
               </div>
@@ -3921,24 +4135,25 @@ export default function Home() {
             </div>
           )}
 
-          {showPaywall && !isPro && (
+          {showPaywall && (
             <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/55 px-3 pb-6 backdrop-blur-md sm:items-center" onClick={() => setShowPaywall(false)}>
               <div className="on-gradient relative z-[81] w-full max-w-[390px] rounded-[28px] border border-white/10 p-5" role="dialog" aria-modal="true" aria-labelledby="pay-title" style={{ overflowY: 'auto', maxHeight: '88dvh', background: 'linear-gradient(168deg, #171b24 0%, #0e1117 62%)', color: '#f4f6f8', boxShadow: '0 24px 50px rgba(8, 10, 16, 0.28)' }} onClick={(event) => event.stopPropagation()}>
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <p className="text-[10px] font-extrabold tracking-[0.16em] text-[#c4b5fd]">FITBITE PRO</p>
-                    <h2 id="pay-title" className="mt-1 text-[1.65rem] font-black leading-tight tracking-[-0.04em]">Choose a plan</h2>
+                    <h2 id="pay-title" className="mt-1 text-[1.65rem] font-black leading-tight tracking-[-0.04em]">{isPro ? 'Your plan' : 'Choose a plan'}</h2>
+                    {isPro && <p className="mt-1 text-xs font-extrabold text-[#86efac]">FitBite Pro is active</p>}
                   </div>
                   <button type="button" className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-lg" style={{ background: 'rgba(255,255,255,0.1)', color: '#fff' }} aria-label="Close FitBite Pro" onClick={() => setShowPaywall(false)}>✕</button>
                 </div>
                 <div className="mt-4 flex flex-col gap-3">
                   <button type="button" aria-pressed={proPlan === 'monthly'} className="flex min-h-[76px] w-full items-center justify-between gap-3 rounded-2xl px-4 py-3 text-left" style={{ background: proPlan === 'monthly' ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === 'monthly' ? 'inset 0 0 0 2px #fff' : 'inset 0 0 0 1px rgba(255,255,255,0.16)', color: '#fff' }} onClick={() => setProPlan('monthly')}>
-                    <span className="text-sm font-extrabold">Monthly Plan</span>
+                    <span className="text-sm font-extrabold">Monthly Plan {isPro && readUserSubscription().plan === 'monthly' ? '· Active' : ''}</span>
                     <span className="text-base font-black">$4.99/mo</span>
                   </button>
                   <button type="button" aria-pressed={proPlan === 'yearly'} className="flex min-h-[92px] w-full flex-col items-start justify-center gap-2 rounded-2xl px-4 py-3 text-left" style={{ background: proPlan === 'yearly' ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === 'yearly' ? 'inset 0 0 0 2px #fff' : 'inset 0 0 0 1px rgba(255,255,255,0.16)', color: '#fff' }} onClick={() => setProPlan('yearly')}>
                     <span className="flex w-full items-center justify-between gap-3">
-                      <span className="text-sm font-extrabold">Yearly Plan</span>
+                      <span className="text-sm font-extrabold">Yearly Plan {isPro && readUserSubscription().plan === 'yearly' ? '· Active' : ''}</span>
                       <span className="text-base font-black">$29.99/yr</span>
                     </span>
                     <span className="inline-flex rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#047857]">Best Value · Save 50%</span>
@@ -3950,6 +4165,11 @@ export default function Home() {
                   style={{ color: '#0f1115', pointerEvents: 'auto' }}
                   onClick={(event) => {
                     event.stopPropagation();
+                    if (isPro && readUserSubscription().plan === proPlan) {
+                      showToast('FitBite Pro is active');
+                      setShowPaywall(false);
+                      return;
+                    }
                     void subscribeFitBitePro(proPlan).then((result) => {
                       if (!result.ok || !result.active) {
                         showToast('Google Play could not start the purchase');
@@ -3962,7 +4182,7 @@ export default function Home() {
                     });
                   }}
                 >
-                  {pro ? 'Upgrade to Pro' : 'Subscribe Now'}
+                  {isPro ? (readUserSubscription().plan === proPlan ? 'Current plan' : 'Switch plan') : 'Subscribe Now'}
                 </button>
                 <ul className="mt-4 space-y-2 text-sm leading-snug">
                   {[
@@ -4011,19 +4231,106 @@ export default function Home() {
             <div className="fixed inset-0 z-50 grid place-items-end bg-black/55 px-3 pb-6 backdrop-blur-md sm:place-items-center" onClick={() => setScanOpen(false)}>
               <div className="card max-h-[88dvh] w-full max-w-[390px] overflow-y-auto p-5" role="dialog" aria-modal="true" aria-labelledby="scan-title" onClick={(event) => event.stopPropagation()}>
                 <div className="flex items-start justify-between">
-                  <h2 id="scan-title" className="text-xl font-black tracking-[-0.03em]">Scan any watch</h2>
+                  <div>
+                    <h2 id="scan-title" className="text-xl font-black tracking-[-0.03em]">{nativeBle() ? 'Find your watch' : 'Scan any watch'}</h2>
+                    {nativeBle() && <p className="mt-1 text-xs text-muted">{bleState === 'scanning' ? `Scanning… ${bleDevices.length} found` : 'Paired and nearby Bluetooth watches'}</p>}
+                  </div>
                   <button type="button" className="grid h-9 w-9 place-items-center rounded-full text-lg text-slate-400" aria-label="Close scanner" onClick={() => setScanOpen(false)}>✕</button>
                 </div>
-                <div className="relative mx-auto mt-4 grid h-28 w-28 place-items-center" aria-hidden="true">
-                  <span className="bt-ring absolute inset-1 rounded-full border-2 border-[#60a5fa]" />
-                  <span className="bt-ring bt-ring-late absolute inset-1 rounded-full border-2 border-[#818cf8]" />
-                  <span className="absolute inset-7 rounded-full bg-[#eef4ff]" />
-                </div>
-                <p className="mt-4 text-sm text-muted">Bluetooth is unavailable in this browser. Name the watch and it stays paired without a live heart rate until a 0x180D packet arrives.</p>
-                <div className="mt-3 flex gap-2">
-                  <input className={fieldClass} placeholder="Custom watch name" value={customWatchName} maxLength={40} onChange={(e) => setCustomWatchName(e.target.value)} />
-                  <button type="button" className={primaryClass} onClick={() => pairDiscoveredWatch(customWatchName, 'Custom')}>Pair</button>
-                </div>
+                {nativeBle() ? (
+                  <>
+                    {bleState === 'scanning' && (
+                      <div className="relative mx-auto mt-3 grid h-20 w-20 place-items-center" aria-hidden="true">
+                        <span className="bt-ring absolute inset-1 rounded-full border-2 border-[#60a5fa]" />
+                        <span className="bt-ring bt-ring-late absolute inset-1 rounded-full border-2 border-[#818cf8]" />
+                        <span className="absolute inset-6 rounded-full bg-[#eef4ff]" />
+                      </div>
+                    )}
+                    {bleNotice && (
+                      <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+                        <p className="text-sm leading-relaxed text-muted">{bleNotice.text}</p>
+                        {bleNotice.actions.length > 0 && (
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {bleNotice.actions.map((action, index) => (
+                              <button key={action.label} type="button" className={`${index === 0 ? primaryClass : quietClass} h-10 px-4 text-xs`} onClick={action.run}>{action.label}</button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {lastWatch && !bleNotice && (
+                      <div className="mt-4 flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[10px] font-bold tracking-[0.14em] text-muted">LAST WATCH</div>
+                          <div className="truncate text-sm font-extrabold tracking-[-0.02em]">{lastWatch.name}</div>
+                        </div>
+                        <button type="button" className={`${primaryClass} h-9 shrink-0 px-4 text-xs`} disabled={bleLink?.state === 'connecting'} onClick={() => reconnectWatch(lastWatch)}>
+                          {bleLink?.state === 'connecting' && bleLink.mac === lastWatch.mac ? 'Connecting…' : 'Reconnect'}
+                        </button>
+                      </div>
+                    )}
+                    {!bleNotice && (
+                      <div className="mt-3 space-y-2">
+                        {bleDevices.map((device) => {
+                          const busy = bleLink?.state === 'connecting' && bleLink.mac === device.mac;
+                          const bars = signalBars(device.rssi);
+                          return (
+                            <div key={device.mac} className="toast-in flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-sm font-extrabold tracking-[-0.02em]">{device.name}</div>
+                                <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] font-bold text-muted">
+                                  {device.bonded && <span className="rounded-full bg-slate-100 px-1.5 py-0.5">Paired in Android</span>}
+                                  {device.hr && <span className="rounded-full bg-[#dcfce7] px-1.5 py-0.5 text-[#15803d]">Heart rate</span>}
+                                  <span className="tabular-nums">{device.mac}</span>
+                                  <span className="tabular-nums">{device.rssi !== null ? `${device.rssi} dBm` : 'Not in range'}</span>
+                                </div>
+                              </div>
+                              <span className="flex h-4 items-end gap-[2px]" role="img" aria-label={`Signal ${bars} of 4`}>
+                                {[1, 2, 3, 4].map((step) => (
+                                  <span key={step} className="w-[3px] rounded-sm" style={{ height: 4 + step * 3, background: step <= bars ? '#16a34a' : '#cbd5e1' }} />
+                                ))}
+                              </span>
+                              <button type="button" className={`${primaryClass} h-9 shrink-0 px-4 text-xs`} disabled={bleLink?.state === 'connecting'} onClick={() => connectScanned(device)}>
+                                {busy ? (
+                                  <>
+                                    <span className="bt-spin h-3.5 w-3.5 rounded-full border-2 border-white/40 border-t-white" />
+                                    Connecting
+                                  </>
+                                ) : (
+                                  'Connect'
+                                )}
+                              </button>
+                            </div>
+                          );
+                        })}
+                        {bleDevices.length === 0 && bleState !== 'scanning' && (
+                          <p className="rounded-2xl border border-slate-200 bg-white p-4 text-sm leading-relaxed text-muted">
+                            No watches found nearby. Wake the watch, keep it within a metre, and close other apps that hold its Bluetooth link. Watches already paired in Android appear here as soon as you scan.
+                          </p>
+                        )}
+                        {bleDevices.length === 0 && bleState === 'scanning' && (
+                          <p className="px-1 text-center text-xs text-muted">Looking for watches. Keep the watch awake and close.</p>
+                        )}
+                      </div>
+                    )}
+                    {!bleNotice && bleState !== 'scanning' && (
+                      <button type="button" className={`${quietClass} mt-4 w-full`} disabled={bleLink?.state === 'connecting'} onClick={() => void scanAnyWatch()}>Scan again</button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="relative mx-auto mt-4 grid h-28 w-28 place-items-center" aria-hidden="true">
+                      <span className="bt-ring absolute inset-1 rounded-full border-2 border-[#60a5fa]" />
+                      <span className="bt-ring bt-ring-late absolute inset-1 rounded-full border-2 border-[#818cf8]" />
+                      <span className="absolute inset-7 rounded-full bg-[#eef4ff]" />
+                    </div>
+                    <p className="mt-4 text-sm text-muted">Bluetooth is unavailable in this browser. Name the watch and it stays paired without a live heart rate until a 0x180D packet arrives.</p>
+                    <div className="mt-3 flex gap-2">
+                      <input className={fieldClass} placeholder="Custom watch name" value={customWatchName} maxLength={40} onChange={(e) => setCustomWatchName(e.target.value)} />
+                      <button type="button" className={primaryClass} onClick={() => pairDiscoveredWatch(customWatchName, 'Custom')}>Pair</button>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           )}

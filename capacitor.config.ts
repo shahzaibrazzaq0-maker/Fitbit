@@ -5,9 +5,9 @@ import type { CapacitorConfig } from '@capacitor/cli';
  * The defaults open the static pages shipped in `public/`.
  */
 export const APP_LEGAL_URLS = {
-  privacy: '/privacy-policy.html',
-  terms: '/terms-of-use.html',
-  deleteAccount: '/delete-account.html',
+  privacy: 'https://fitbite-pro.vercel.app/privacy',
+  terms: 'https://fitbite-pro.vercel.app/terms',
+  deleteAccount: 'https://fitbite-pro.vercel.app/delete-account.html',
 } as const;
 
 const config: CapacitorConfig = {
