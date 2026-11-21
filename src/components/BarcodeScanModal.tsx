@@ -48,7 +48,11 @@ export function BarcodeScanModal({
           const code = text.replace(/\D/g, '');
           if (lock.current || code.length < 6) return;
           lock.current = true;
-          void next.stop().catch(() => undefined);
+          try {
+            void next.stop().catch(() => undefined);
+          } catch {
+            /* The scanner already stopped. */
+          }
           onCodeRef.current(code);
         },
         () => undefined,
@@ -59,7 +63,12 @@ export function BarcodeScanModal({
     });
     return () => {
       dead = true;
-      void scanner?.stop().then(() => scanner?.clear()).catch(() => undefined);
+      try {
+        // stop() throws at once when the camera never started, so the call needs its own guard.
+        void scanner?.stop().then(() => scanner?.clear()).catch(() => undefined);
+      } catch {
+        /* No camera was running. */
+      }
     };
   }, [open, cameraFallback]);
 

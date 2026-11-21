@@ -1,3 +1,4 @@
+import { readTtl, writeTtl } from '@/lib/aiCache';
 import { dietRuleLine, readDiet } from '@/lib/dietProfile';
 import { aiLanguageName, readLang } from '@/lib/i18n';
 import { readUnits, unitRuleLine } from '@/lib/units';
@@ -194,22 +195,50 @@ function retryableAiError(message: string) {
   return /429|503|timeout|busy|high demand|rate limit|network|fetch/i.test(message);
 }
 
-async function postAi(body: Record<string, unknown>, timeoutMs = 45000) {
+/** Aborts after `ms`, or sooner when the caller's signal fires. `clear` releases the timer and the link. */
+export function withTimeout(parent: AbortSignal | undefined, ms: number) {
+  const ctrl = new AbortController();
+  const abort = () => ctrl.abort();
+  if (parent?.aborted) ctrl.abort();
+  else parent?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, ms);
+  return {
+    signal: ctrl.signal,
+    clear: () => {
+      clearTimeout(timer);
+      parent?.removeEventListener('abort', abort);
+    },
+  };
+}
+
+function cancelled(signal?: AbortSignal) {
+  return signal?.aborted === true;
+}
+
+function pause(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
+async function postAi(body: Record<string, unknown>, timeoutMs = 45000, parent?: AbortSignal) {
   let last = 'network';
   const attempts = timeoutMs <= 8000 ? 1 : 2;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const guard = withTimeout(parent, timeoutMs);
     try {
       const response = await fetch(aiEndpoint(), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ ...body, prefs: requestPreferences() }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: guard.signal,
       });
       const raw = await response.text();
       if (!response.ok) {
         last = response.status === 429 || response.status === 503 ? `HTTP ${response.status}` : 'proxy';
-        if (attempt === 0 && (response.status === 429 || response.status === 503 || response.status >= 500)) {
-          await new Promise((resolve) => setTimeout(resolve, 800));
+        if (attempt === 0 && !cancelled(parent) && (response.status === 429 || response.status === 503 || response.status >= 500)) {
+          await pause(600, parent);
           continue;
         }
         throw new Error(last);
@@ -217,20 +246,32 @@ async function postAi(body: Record<string, unknown>, timeoutMs = 45000) {
       return JSON.parse(raw) as { text?: string; route?: string; card?: ScanCard; error?: string };
     } catch (error) {
       last = error instanceof Error ? error.message : 'network';
+      if (cancelled(parent)) throw error instanceof Error ? error : new Error('cancelled');
       if (attempt === 0 && retryableAiError(last)) {
-        await new Promise((resolve) => setTimeout(resolve, 800));
+        await pause(600, parent);
         continue;
       }
       throw error instanceof Error ? error : new Error(last);
+    } finally {
+      guard.clear();
     }
   }
   throw new Error(last);
 }
 
-export async function analyzeFoodPhoto(prompt: string, jpeg: string) {
+let warmed = false;
+
+/** One light request wakes the server function and the connection before the first real question. */
+export function warmAiServer() {
+  if (warmed || typeof window === 'undefined') return;
+  warmed = true;
+  void fetch(aiEndpoint(), { method: 'OPTIONS' }).catch(() => undefined);
+}
+
+export async function analyzeFoodPhoto(prompt: string, jpeg: string, signal?: AbortSignal) {
   if (!jpeg || jpeg.length < 32) return { error: 'The photo was empty. Take another one.' };
   try {
-    const data = await postAi({ op: 'vision', prompt, jpeg });
+    const data = await postAi({ op: 'vision', prompt, jpeg }, 30000, signal);
     if (data.card?.name) {
       route = data.card.model || 'Gemini 3.5 Flash Lite';
       return { card: data.card };
@@ -238,6 +279,7 @@ export async function analyzeFoodPhoto(prompt: string, jpeg: string) {
     const message = data.error || 'The scan did not return nutrition.';
     return { error: message.slice(0, 180) };
   } catch {
+    if (cancelled(signal)) return { error: 'Cancelled' };
     return { error: 'The scan didn’t reach the server. Tap the photo again to retry.' };
   }
 }
@@ -252,7 +294,7 @@ export async function transcribeSpeech(audioBase64: string, mimeType: string) {
   }
 }
 
-export async function askNeural(prompt: string, jpeg: string | undefined, tokens: number, temperature: number, timeoutMs = 45000) {
+export async function askNeural(prompt: string, jpeg: string | undefined, tokens: number, temperature: number, timeoutMs = 45000, signal?: AbortSignal) {
   const cacheId = hashString(`${prompt}|${jpeg?.length ?? 0}|${jpeg?.slice(0, 48) ?? ''}`).toString(16);
   const cached = readAiCache(cacheId);
   if (cached) {
@@ -260,7 +302,7 @@ export async function askNeural(prompt: string, jpeg: string | undefined, tokens
     return cached;
   }
   try {
-    const data = await postAi({ op: 'ask', prompt, jpeg, tokens, temperature }, timeoutMs);
+    const data = await postAi({ op: 'ask', prompt, jpeg, tokens, temperature }, timeoutMs, signal);
     if (data.text) {
       route = data.route || 'Gemini';
       writeAiCache(cacheId, data.text);
@@ -271,6 +313,133 @@ export async function askNeural(prompt: string, jpeg: string | undefined, tokens
   }
   route = 'On-device';
   return '';
+}
+
+export interface StreamOptions {
+  kind: 'coach' | 'kitchen';
+  system: string;
+  prompt: string;
+  history?: { role: 'user' | 'model'; text: string }[];
+  tokens: number;
+  temperature: number;
+  signal?: AbortSignal;
+  /** Called with the full text so far each time new words arrive. */
+  onText?: (text: string) => void;
+  /** A key from `ttlKey`. A fresh 24-hour hit answers instantly and costs nothing. */
+  cacheKey?: string;
+}
+
+/** Streams one reply word by word. Throws only when the caller cancels. Returns '' when no model answered. */
+export async function streamNeural(opts: StreamOptions): Promise<string> {
+  if (opts.cacheKey) {
+    const hit = readTtl(opts.cacheKey);
+    if (hit) {
+      route = 'Cache';
+      opts.onText?.(hit);
+      return hit;
+    }
+  }
+  let text = '';
+  for (let attempt = 0; attempt < 2 && !text; attempt += 1) {
+    // First word within 12 seconds, then 15 seconds of quiet at most between chunks.
+    let guard = withTimeout(opts.signal, 12000);
+    try {
+      const response = await fetch(aiEndpoint(), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          op: 'stream',
+          kind: opts.kind,
+          system: opts.system,
+          prompt: opts.prompt,
+          history: (opts.history ?? []).slice(-6),
+          tokens: opts.tokens,
+          temperature: opts.temperature,
+          prefs: requestPreferences(),
+        }),
+        signal: guard.signal,
+      });
+      const streamed = response.ok && (response.headers.get('content-type') || '').startsWith('text/plain') && response.body;
+      if (!streamed) {
+        // An older server answers in one piece, so the regular route still works.
+        guard.clear();
+        const whole = await askNeural(`${opts.system}\n\n${(opts.history ?? []).slice(-6).map((row) => `${row.role === 'user' ? 'User' : 'Coach'}: ${row.text}`).join('\n')}\nUser: ${opts.prompt}`.trim(), undefined, opts.tokens, opts.temperature, 25000, opts.signal);
+        if (whole) opts.onText?.(whole);
+        text = whole;
+        break;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const served = response.headers.get('x-ai-route') || 'Gemini';
+      for (;;) {
+        const { done, value } = await reader.read();
+        guard.clear();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+        opts.onText?.(text);
+        guard = withTimeout(opts.signal, 15000);
+      }
+      text += decoder.decode();
+      route = served;
+    } catch (error) {
+      if (cancelled(opts.signal)) throw error instanceof Error ? error : new Error('cancelled');
+      if (!text) await pause(500, opts.signal);
+      if (cancelled(opts.signal)) throw new Error('cancelled');
+    } finally {
+      guard.clear();
+    }
+  }
+  text = scrub(text).trim();
+  if (!text) {
+    route = 'On-device';
+    return '';
+  }
+  if (opts.cacheKey && route !== 'On-device' && route !== 'Unavailable') writeTtl(opts.cacheKey, text);
+  return text;
+}
+
+/** Reads the kitchen's plain-text recipe lines. Works on partial text, so the card fills in while streaming. */
+export function recipeFromStream(raw: string): RecipeCard | null {
+  const text = scrub(raw).trim();
+  if (!text) return null;
+  if (text.startsWith('{') || text.startsWith('```')) {
+    try {
+      return recipeFromGemini(text);
+    } catch {
+      return null;
+    }
+  }
+  let title = '';
+  let calories = 0;
+  let protein = 0;
+  let carbs = 0;
+  let fats = 0;
+  let halal = false;
+  const steps: string[] = [];
+  const lines = raw.split('\n');
+  lines.forEach((line, index) => {
+    const row = line.trim();
+    if (!row) return;
+    const done = index < lines.length - 1 || raw.endsWith('\n');
+    const heading = row.match(/^title\s*:\s*(.*)$/i);
+    if (heading) {
+      title = heading[1].replace(/\*+/g, '').trim().slice(0, 80);
+      return;
+    }
+    if (/^macros?\s*:/i.test(row) && done) {
+      const num = (pattern: RegExp) => Number((row.match(pattern) || [])[1] ?? 0) || 0;
+      calories = num(/(\d+)\s*kcal/i) || num(/(\d+)\s*cal/i);
+      protein = num(/\bP\s*(\d+)/i);
+      carbs = num(/\bC\s*(\d+)/i);
+      fats = num(/\bF\s*(\d+)/i);
+      halal = /halal\s*:?\s*yes/i.test(row) && !HARAM_NAME.test(title.toLowerCase());
+      return;
+    }
+    const step = row.match(/^\d+[.)]\s*(.+)$/);
+    if (step && steps.length < 4) steps.push(step[1].replace(/\*+/g, '').trim().slice(0, 120));
+  });
+  if (!title) return null;
+  return { title, cal: calories, protein, carbs, fats, steps, halal };
 }
 
 export interface WellnessChallenge {

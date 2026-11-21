@@ -104,14 +104,25 @@ export function mapOffProduct(barcode: string, data: OffJson): OffProduct | null
   };
 }
 
-export async function lookupOpenFoodFacts(barcode: string): Promise<OffProduct | null> {
+/** Barcode first: a hit is instant and free. Returns null when the product is unknown, so the caller can ask the AI. */
+export async function lookupOpenFoodFacts(barcode: string, signal?: AbortSignal): Promise<OffProduct | null> {
   const code = barcode.replace(/\D/g, '');
   if (code.length < 6) return null;
   const cached = readCache(code);
   if (cached) return cached;
-  const response = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json?fields=product_name,brands,nutriments,nutriscore_grade,nova_group,allergens_tags,ingredients_analysis_tags,serving_size,image_front_small_url`);
-  if (!response.ok) return null;
-  const product = mapOffProduct(code, (await response.json()) as OffJson);
-  if (product) writeCache(product);
-  return product;
+  const ctrl = new AbortController();
+  const stop = () => ctrl.abort();
+  if (signal?.aborted) ctrl.abort();
+  else signal?.addEventListener('abort', stop, { once: true });
+  const timer = setTimeout(stop, 5000);
+  try {
+    const response = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json?fields=product_name,brands,nutriments,nutriscore_grade,nova_group,allergens_tags,ingredients_analysis_tags,serving_size,image_front_small_url`, { signal: ctrl.signal });
+    if (!response.ok) return null;
+    const product = mapOffProduct(code, (await response.json()) as OffJson);
+    if (product) writeCache(product);
+    return product;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', stop);
+  }
 }

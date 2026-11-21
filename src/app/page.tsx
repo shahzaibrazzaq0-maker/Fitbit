@@ -6,7 +6,8 @@ import { APP_LEGAL_URLS } from '../../capacitor.config';
 import { SpeechRecognition } from '@capacitor-community/speech-recognition';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { BarcodeScanModal } from '@/components/BarcodeScanModal';
-import { analyzeFoodPhoto, askNeural, engineRoute as readEngineRoute, lastAiWasBillable, localWellnessChallenge, parseJsonRecord, parseScanNutrition, preferencePrompt, recipeFromGemini, suggestDailyChallenge, transcribeSpeech, type WellnessChallenge } from '@/lib/aiEngine';
+import { AI_TTL_KEY, readTtl, ttlKey } from '@/lib/aiCache';
+import { analyzeFoodPhoto, askNeural, engineRoute as readEngineRoute, lastAiWasBillable, localWellnessChallenge, parseJsonRecord, parseScanNutrition, preferencePrompt, recipeFromStream, streamNeural, suggestDailyChallenge, transcribeSpeech, warmAiServer, type WellnessChallenge } from '@/lib/aiEngine';
 import { AI_CONSENT_KEY, DIET_KEY, DIET_FLAGS, dietRuleLine, emptyDiet, judgeDiet, readAiConsent, readDiet, writeAiConsent, writeDiet, type DietCode, type DietPrefs } from '@/lib/dietProfile';
 import { LANG_KEY, LANGS, aiLanguageName, applyDocumentLanguage, languageName, readLang, translate, writeLang, type CopyKey, type Lang } from '@/lib/i18n';
 import { lookupOpenFoodFacts, OFF_CACHE_KEY, type OffProduct } from '@/lib/openFoodFacts';
@@ -1235,13 +1236,26 @@ function coachContextLine(ctx: CoachContext) {
 function coachSystemPrompt(ctx: CoachContext) {
   const stats = coachContextLine(ctx);
   const units = readUnits();
+  const diet = readDiet();
+  const today = JSON.stringify({
+    kcal: ctx.calories,
+    kcalGoal: CAL_GOAL,
+    protein: ctx.protein,
+    carbs: ctx.carbs,
+    fat: ctx.fats,
+    steps: ctx.steps,
+    water: `${formatWater(ctx.waterL, units)}/${formatWaterGoal(units)}`,
+    burned: Math.round(ctx.burned),
+    sleepH: ctx.sleepHrs,
+    lang: readLang(),
+    diet: DIET_FLAGS.filter((flag) => diet[flag]),
+    units,
+  });
   return [
-    'You are FitBite Pro’s coach. Direct answer only.',
-    'Reply in the user’s exact language and script. Maximum 3 short sentences or 3 bullets. No essay.',
+    'You are FitBite Pro’s coach. Direct answer only. Reply in the user’s exact language and script. Max 3 short sentences or 3 bullets.',
     `Athlete: ${ctx.name}, ${ctx.gender}, age ${ctx.age}, ${formatHeightUnits(ctx.heightCm, units)}, ${formatWeight(ctx.weightKg, units)}, BMI ${stats.bmi.toFixed(1)}.`,
-    `Today: ${ctx.calories} of ${CAL_GOAL} kcal eaten, ${ctx.protein}g protein, ${ctx.carbs}g carbs, ${ctx.fats}g fat, ${ctx.steps} of ${STEP_GOAL} steps, ${formatWater(ctx.waterL, units)} of ${formatWaterGoal(units)} water, about ${Math.round(ctx.burned)} kcal burned, ${ctx.sleepHrs} h sleep.`,
+    `Today: ${today}`,
     `Targets: maintenance about ${stats.maintain} kcal, a steady cut near ${stats.cut} kcal, protein about ${stats.proteinGoal} g.`,
-    preferencePrompt(),
   ].join('\n');
 }
 
@@ -1271,16 +1285,16 @@ async function pinDigest(pin: string) {
 
 function localCoachFromPrompt(prompt: string) {
   const user = (prompt.split('User:').pop() || '').trim();
-  const today = (prompt.match(/Today: ([^\n]+)/) || [])[1] || '';
   if (readLang() === 'ar') return 'ركّز اليوم على إكمال البروتين وشرب الماء وإبقاء السعرات ضمن هدفك. ليسدّ طعامك القادم أكبر فجوة.';
   if (/[\u0600-\u06FF]/.test(user)) return 'آج پروٹین پورا کریں، پانی پئیں، اور کیلوریز ہدف کے اندر رکھیں۔ اگلا کھانا سب سے بڑے فرق کو بند کرے۔';
   if (/\b(kya|kaise|karun|karo|hai|nahi|mujhe|mera)\b/i.test(user)) return 'Seedha jawab: protein complete karo, pani pio, aur calories goal ke andar rakho. Agla meal sab se bari kami pur kare.';
   if (/water|hydrat/i.test(user)) return `Drink toward ${formatWaterGoal(readUnits())}. One glass now if you are still under the line.`;
   if (/protein/i.test(user)) return 'Close the protein gap with one lean serving. The target is already on your profile.';
   if (/workout|run|gym|bench|squat/i.test(user)) return 'Do the session you planned. Stop with one rep left in reserve.';
-  return `Stay with today’s targets. ${today || 'Calories, protein, and water are the three numbers that matter.'} Let the next meal close the biggest gap.`;
+  return 'Stay with today’s targets. Calories, protein, and water are the three numbers that matter. Let the next meal close the biggest gap.';
 }
 
+/** Resizes to at most 768 px on an offscreen canvas and exports a compressed JPEG (about 60 to 150 KB). */
 function jpegBase64(source: CanvasImageSource, width: number, height: number) {
   const max = 768;
   const scale = Math.min(1, max / Math.max(width, height, 1));
@@ -1289,13 +1303,15 @@ function jpegBase64(source: CanvasImageSource, width: number, height: number) {
   canvas.height = Math.max(1, Math.round(height * scale));
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('The photo could not be prepared. Try another one.');
+  ctx.imageSmoothingQuality = 'medium';
   ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-  const data = (canvas.toDataURL('image/jpeg', 0.8).split(',')[1] ?? '').trim();
+  let data = (canvas.toDataURL('image/jpeg', 0.72).split(',')[1] ?? '').trim();
+  if (data.length > 200000) data = (canvas.toDataURL('image/jpeg', 0.6).split(',')[1] ?? '').trim();
   if (data.length < 32) throw new Error('The photo was empty. Take another one.');
   return data;
 }
 
-function fileToJpeg(file: File) {
+function imageElementToJpeg(file: File) {
   return new Promise<string>((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
@@ -1317,23 +1333,33 @@ function fileToJpeg(file: File) {
   });
 }
 
-async function askGeminiText(prompt: string) {
-  const text = await askNeural(prompt, undefined, 160, 0.4, 8000);
-  return text || localCoachFromPrompt(prompt);
+/** Decodes off the main thread when the browser can, then shrinks. Older WebViews use an image element. */
+async function fileToJpeg(file: File) {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+      try {
+        return jpegBase64(bitmap, bitmap.width, bitmap.height);
+      } finally {
+        bitmap.close();
+      }
+    } catch {
+      /* The image element path below reads the same file. */
+    }
+  }
+  return imageElementToJpeg(file);
 }
 
 function scanPrompt(note: string, extra: string) {
   return [
-    'Identify one serving. JSON only, no markdown.',
+    'Identify one serving of the food. Compact JSON only, no markdown.',
     extra,
-    note.trim() ? `User note: ${note.trim()}` : 'User note: none',
-    'Write name and verdict in the note’s language. Keep JSON keys in English.',
-    'Set halal true only when the food is verified halal. Otherwise false.',
-    'contains lists allergen words you can see, such as gluten, milk, nuts, pork. Otherwise [].',
-    'verdict is one short sentence.',
-    preferencePrompt(),
-    '{"name":"","servingG":0,"score":7,"calories":0,"carbs":0,"protein":0,"fat":0,"fiber":0,"calcium":0,"iron":0,"sugar":0,"sodium":0,"vitamins":["Vitamin C"],"halal":false,"contains":[],"verdict":""}',
-  ].join('\n');
+    note.trim() ? `User note: ${note.trim()}` : '',
+    'name and verdict use the note’s language. Keys stay English.',
+    'halal is true only when the food is verified halal, otherwise false. contains lists visible allergen words (gluten, milk, nuts, pork) or [].',
+    'score is health 1 to 10. verdict is at most 10 words.',
+    '{"name":"","servingG":0,"score":7,"calories":0,"protein":0,"carbs":0,"fat":0,"halal":false,"contains":[],"verdict":""}',
+  ].filter(Boolean).join('\n');
 }
 
 async function readBarcode(source: CanvasImageSource) {
@@ -1348,13 +1374,13 @@ async function readBarcode(source: CanvasImageSource) {
   }
 }
 
-async function askGeminiScan(prompt: string, jpeg?: string) {
+async function askGeminiScan(prompt: string, jpeg: string | undefined, signal?: AbortSignal) {
   if (jpeg) {
-    const outcome = await analyzeFoodPhoto(prompt, jpeg);
+    const outcome = await analyzeFoodPhoto(prompt, jpeg, signal);
     if ('error' in outcome) throw new Error(outcome.error);
     return outcome.card;
   }
-  const text = await askNeural(prompt, undefined, 360, 0.2);
+  const text = await askNeural(prompt, undefined, 450, 0.2, 30000, signal);
   if (!text) throw new Error('The scan didn’t finish. Tap the photo again to retry.');
   try {
     return { ...parseScanNutrition(text), model: readEngineRoute() };
@@ -1363,23 +1389,50 @@ async function askGeminiScan(prompt: string, jpeg?: string) {
   }
 }
 
-async function askGeminiRecipe(names: string[], craving = '') {
+function dietSignature() {
+  const diet = readDiet();
+  return DIET_FLAGS.filter((flag) => diet[flag]).join(',');
+}
+
+/** A quick-chip answer stays valid while the day's numbers sit in the same coarse buckets. */
+function coachChipKey(preset: string, ctx: CoachContext) {
+  return ttlKey('coach', [preset, readLang(), readUnits(), dietSignature(), Math.round(ctx.calories / 150), Math.round(ctx.protein / 15), Math.round(ctx.waterL * 2), Math.round(ctx.steps / 2500)]);
+}
+
+function recipeCacheKey(names: string[], craving: string) {
+  return ttlKey('kitchen', [[...names].map((name) => name.trim().toLowerCase()).sort().join(','), craving, readLang(), readUnits(), dietSignature()]);
+}
+
+type StreamedRecipe = { title: string; cal: number; protein: number; carbs: number; fats: number; steps: string[]; halal: boolean };
+
+async function askGeminiRecipe(names: string[], craving = '', signal?: AbortSignal, onPartial?: (recipe: StreamedRecipe) => void) {
   const prompt = [
-    'One short recipe using only these ingredients:',
-    names.join(', '),
+    `One short recipe using only these ingredients: ${names.join(', ')}.`,
     craving ? `Style: ${craving}. Keep it gentle everyday food, not a medical plan.` : 'Keep it gentle everyday food.',
-    preferencePrompt(),
-    'Max 4 one-line steps. JSON only:',
-    '{"title":"","calories":0,"protein":0,"carbs":0,"fats":0,"halal":false,"steps":["","","",""]}',
+    'Reply as plain text, exactly these lines and nothing else:',
+    'TITLE: recipe name',
+    'MACROS: N kcal | P N | C N | F N | HALAL yes or no',
+    'Replace every N with your own estimate in grams (calories in kcal) for one serving. Never copy example numbers.',
+    '1. step of at most 12 words',
+    '2. step of at most 12 words',
+    'Use 2 to 4 numbered steps.',
   ].join('\n');
-  const text = await askNeural(prompt, undefined, 220, 0.3);
+  const text = await streamNeural({
+    kind: 'kitchen',
+    system: '',
+    prompt,
+    tokens: 450,
+    temperature: 0.3,
+    signal,
+    cacheKey: recipeCacheKey(names, craving),
+    onText: (partial) => {
+      const card = recipeFromStream(partial);
+      if (card) onPartial?.({ ...card, halal: card.halal === true });
+    },
+  });
   if (text) {
-    try {
-      const recipe = recipeFromGemini(text);
-      return { ...recipe, halal: recipe.halal === true, live: true as const };
-    } catch {
-      /* Fridge math is the backup plate. */
-    }
+    const recipe = recipeFromStream(text);
+    if (recipe && recipe.cal > 0 && recipe.steps.length > 0) return { ...recipe, halal: recipe.halal === true, live: true as const };
   }
   const local = cookFromFridge(names);
   return { ...local, steps: local.steps.slice(0, 4), halal: false, live: false as const };
@@ -1636,6 +1689,7 @@ export default function Home() {
   const [aiResult, setAiResult] = useState<AiScanResult | null>(null);
   const [coachBusy, setCoachBusy] = useState(false);
   const [recipeBusy, setRecipeBusy] = useState(false);
+  const [coachLive, setCoachLive] = useState<{ id: number; text: string } | null>(null);
   const [ingredient, setIngredient] = useState('');
   const [recipe, setRecipe] = useState<KitchenRecipe | null>(null);
   const [chatInput, setChatInput] = useState('');
@@ -1677,6 +1731,10 @@ export default function Home() {
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const scanLock = useRef(false);
+  const coachAbort = useRef<AbortController | null>(null);
+  const coachCancel = useRef<'clear' | 'leave' | null>(null);
+  const kitchenAbort = useRef<AbortController | null>(null);
+  const scanAbort = useRef<AbortController | null>(null);
   const voiceStop = useRef<(() => void) | null>(null);
   const vaultOn = useRef(false);
   const preserveStore = useRef(false);
@@ -1708,7 +1766,7 @@ export default function Home() {
     nativeBle()?.stopScan?.();
     nativeBle()?.disconnectWatch?.();
     preserveStore.current = true;
-    for (const key of [STORAGE_KEY, LEGACY_KEY, PREFS_KEY, VAULT_KEY, CHALLENGE_KEY, QUOTA_STORAGE_KEY, DIET_KEY, LANG_KEY, UNITS_KEY, AI_CONSENT_KEY, OFF_CACHE_KEY, LAST_WATCH_KEY, SUBSCRIPTION_KEY, 'fitbite_ai_cache_v1', 'fitbite_ai_reports_v1']) {
+    for (const key of [STORAGE_KEY, LEGACY_KEY, PREFS_KEY, VAULT_KEY, CHALLENGE_KEY, QUOTA_STORAGE_KEY, DIET_KEY, LANG_KEY, UNITS_KEY, AI_CONSENT_KEY, OFF_CACHE_KEY, AI_TTL_KEY, LAST_WATCH_KEY, SUBSCRIPTION_KEY, 'fitbite_ai_cache_v1', 'fitbite_ai_reports_v1']) {
       window.localStorage.removeItem(key);
     }
     try {
@@ -1863,7 +1921,18 @@ export default function Home() {
 
   useEffect(() => {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight });
-  }, [store.chat, aiTab]);
+  }, [store.chat, aiTab, coachLive]);
+
+  // Leaving a feature cancels its running request, so a stale answer never lands on a screen that moved on.
+  useEffect(() => {
+    if (activeTab !== 'ai' || aiTab !== 'coach') {
+      coachCancel.current = 'leave';
+      coachAbort.current?.abort();
+    }
+    if (activeTab !== 'ai' || aiTab !== 'kitchen') kitchenAbort.current?.abort();
+    if (activeTab !== 'ai' || aiTab !== 'scan') scanAbort.current?.abort();
+    if (activeTab === 'ai') warmAiServer();
+  }, [activeTab, aiTab]);
 
   useEffect(() => () => {
     voiceStop.current?.();
@@ -2207,6 +2276,9 @@ export default function Home() {
   };
 
   const clearChat = () => {
+    coachCancel.current = 'clear';
+    coachAbort.current?.abort();
+    setCoachLive(null);
     setCoachBusy(false);
     setChatInput('');
     patch({ chat: coachWelcome() });
@@ -2215,31 +2287,69 @@ export default function Home() {
   const sendChat = (preset?: string) => {
     const text = (preset ?? chatInput).trim();
     if (!text || coachBusy) return;
-    if (blockForQuota('coach')) return;
     const ctx = coachContext();
-    const prompt = `${coachSystemPrompt(ctx)}\n\nUser: ${text}`;
+    // A repeat quick-chip tap is answered from the 24-hour cache, so it never waits on the quota or the network.
+    const cacheKey = preset ? coachChipKey(preset, ctx) : undefined;
+    if (!(cacheKey && readTtl(cacheKey)) && blockForQuota('coach')) return;
+    const system = coachSystemPrompt(ctx);
+    const history = store.chat
+      .filter((message) => message.id !== 1 && message.text && message.text !== 'Generating...')
+      .slice(-6)
+      .map((message) => ({ role: message.sender === 'user' ? 'user' as const : 'model' as const, text: message.text.slice(0, 500) }));
+    const fallbackPrompt = `${system}\nUser: ${text}`;
     const userId = nextId();
     const aiId = nextId();
+    coachAbort.current?.abort();
+    const controller = new AbortController();
+    coachAbort.current = controller;
+    coachCancel.current = null;
     setChatInput('');
     setCoachBusy(true);
+    setCoachLive({ id: aiId, text: '' });
     setStore((s) => {
       if (s.chat.some((message) => message.id === userId)) return s;
       return { ...s, chat: [...s.chat, { id: userId, sender: 'user', text }, { id: aiId, sender: 'ai', text: 'Generating...' }] };
     });
     void (async () => {
-      let reply = localCoachFromPrompt(prompt);
+      let reply = '';
+      let partial = '';
       try {
-        reply = await askGeminiText(prompt);
-        if (lastAiWasBillable()) {
+        reply = await streamNeural({
+          kind: 'coach',
+          system,
+          prompt: text,
+          history,
+          tokens: 350,
+          temperature: 0.4,
+          signal: controller.signal,
+          cacheKey,
+          onText: (next) => {
+            partial = next;
+            if (mounted.current && !controller.signal.aborted) setCoachLive({ id: aiId, text: next });
+          },
+        });
+        if (!controller.signal.aborted && lastAiWasBillable()) {
           spendQuota('coach', pro);
           if (mounted.current) setQuotaTick((tick) => tick + 1);
         }
       } catch {
-        reply = localCoachFromPrompt(prompt);
+        reply = '';
       } finally {
-        if (mounted.current) {
-          setStore((s) => ({ ...s, chat: s.chat.map((message) => (message.id === aiId ? { ...message, text: reply || localCoachFromPrompt(prompt) } : message)) }));
+        const latest = coachAbort.current === controller;
+        if (latest) coachAbort.current = null;
+        if (mounted.current && latest) {
+          setCoachLive(null);
           setCoachBusy(false);
+          if (!controller.signal.aborted) {
+            setStore((s) => ({ ...s, chat: s.chat.map((message) => (message.id === aiId ? { ...message, text: reply || localCoachFromPrompt(fallbackPrompt) } : message)) }));
+          } else if (coachCancel.current !== 'clear') {
+            // Left mid-answer: keep the words that arrived, or take the question back into the box.
+            if (partial.trim()) setStore((s) => ({ ...s, chat: s.chat.map((message) => (message.id === aiId ? { ...message, text: partial } : message)) }));
+            else {
+              setStore((s) => ({ ...s, chat: s.chat.filter((message) => message.id !== userId && message.id !== aiId) }));
+              setChatInput((current) => current || text);
+            }
+          }
         }
       }
     })();
@@ -2257,12 +2367,15 @@ export default function Home() {
     return true;
   };
 
-  const runScan = (task: () => Promise<ScanNutrition>, held = false) => {
+  const runScan = (task: (signal: AbortSignal) => Promise<ScanNutrition>, held = false) => {
     if (!held && scanLock.current) return;
     if (blockForQuota('scan')) {
       releaseScan();
       return;
     }
+    scanAbort.current?.abort();
+    const controller = new AbortController();
+    scanAbort.current = controller;
     scanLock.current = true;
     setScanBusy(true);
     setScanResult(null);
@@ -2271,8 +2384,8 @@ export default function Home() {
     const stageTimer = window.setTimeout(() => setScanStage('Calculating macros...'), 700);
     void (async () => {
       try {
-        const card = await task();
-        if (!mounted.current) return;
+        const card = await task(controller.signal);
+        if (!mounted.current || controller.signal.aborted) return;
         setScanResult(card);
         setScanNotice('');
         if (lastAiWasBillable()) {
@@ -2280,12 +2393,13 @@ export default function Home() {
           setQuotaTick((tick) => tick + 1);
         }
       } catch (error) {
-        if (!mounted.current) return;
+        if (!mounted.current || controller.signal.aborted) return;
         setScanResult(null);
         const message = error instanceof Error ? error.message : 'The scan did not finish.';
         setScanNotice(message.replace(/^Vision API limit reached:\s*/i, '').slice(0, 180));
       } finally {
         window.clearTimeout(stageTimer);
+        if (scanAbort.current === controller) scanAbort.current = null;
         scanLock.current = false;
         if (mounted.current) {
           setScanBusy(false);
@@ -2301,12 +2415,14 @@ export default function Home() {
       showToast(translate(readLang(), 'consentNeed'));
       return;
     }
-    runScan(() => askGeminiScan(scanPrompt(scanNote, 'Use the attached photo. Estimate the visible portion.'), jpeg), held);
+    runScan((signal) => askGeminiScan(scanPrompt(scanNote, 'Use the attached photo. Estimate the visible portion.'), jpeg, signal), held);
   };
 
-  const resolveBarcode = (code: string) => {
+  /** Open Food Facts answers first and costs nothing. The AI only reads the photo when the barcode is unknown. */
+  const resolveBarcode = (code: string, jpeg?: string, held = false) => {
     const clean = code.replace(/\D/g, '');
     if (clean.length < 6) {
+      if (held) releaseScan();
       showToast(translate(readLang(), 'manual'));
       return;
     }
@@ -2316,31 +2432,65 @@ export default function Home() {
     setAiTab('scan');
     setOffCard(null);
     setOffNote(translate(readLang(), 'looking'));
-    void lookupOpenFoodFacts(clean).then((product) => {
-      if (!mounted.current) return;
-      setOffCard(product);
-      setOffNote(product ? '' : translate(readLang(), 'missing'));
+    scanAbort.current?.abort();
+    const controller = new AbortController();
+    scanAbort.current = controller;
+    const finish = () => {
+      if (scanAbort.current === controller) scanAbort.current = null;
+    };
+    void lookupOpenFoodFacts(clean, controller.signal).then((product) => {
+      finish();
+      if (!mounted.current || controller.signal.aborted) {
+        if (held) releaseScan();
+        return;
+      }
+      if (product) {
+        setOffCard(product);
+        setOffNote('');
+        if (held) releaseScan();
+      } else if (jpeg) {
+        setOffNote('');
+        analyzePhoto(jpeg, held);
+      } else {
+        setOffCard(null);
+        setOffNote(translate(readLang(), 'missing'));
+      }
     }).catch(() => {
-      if (!mounted.current) return;
+      finish();
+      if (!mounted.current || controller.signal.aborted) {
+        if (held) releaseScan();
+        return;
+      }
+      if (jpeg) {
+        setOffNote('');
+        analyzePhoto(jpeg, held);
+        return;
+      }
+      if (held) releaseScan();
       setOffCard(null);
       setOffNote(translate(readLang(), 'missing'));
     });
   };
 
-  const analyzeBarcode = (code: string, _jpeg?: string, held = false) => {
-    if (held) releaseScan();
-    resolveBarcode(code);
-  };
-
   const onPickScanPhoto = (file: File | undefined, asBarcode = false) => {
     if (!file || !holdScan()) return;
+    scanAbort.current?.abort();
+    const controller = new AbortController();
+    scanAbort.current = controller;
+    // The preview shows at once, before any compression starts.
     const preview = URL.createObjectURL(file);
     setScanPreview((current) => {
       if (current) URL.revokeObjectURL(current);
       return preview;
     });
+    setScanResult(null);
+    setScanNotice('');
     void fileToJpeg(file)
       .then((jpeg) => {
+        if (controller.signal.aborted) {
+          releaseScan();
+          return;
+        }
         if (!asBarcode && scanMode === 'photo') {
           analyzePhoto(jpeg, true);
           return;
@@ -2348,7 +2498,11 @@ export default function Home() {
         return createImageBitmap(file).then(async (bitmap) => {
           const code = await readBarcode(bitmap);
           bitmap.close();
-          if (code) analyzeBarcode(code, jpeg, true);
+          if (controller.signal.aborted) {
+            releaseScan();
+            return;
+          }
+          if (code) resolveBarcode(code, jpeg, true);
           else analyzePhoto(jpeg, true);
         });
       })
@@ -2366,26 +2520,36 @@ export default function Home() {
       showToast('Add an ingredient first');
       return;
     }
-    if (blockForQuota('kitchen')) return;
     const plate = names.length > 0 ? names : [chosen];
+    // The same ingredients with the same filters inside 24 hours return instantly.
+    if (!readTtl(recipeCacheKey(plate, chosen)) && blockForQuota('kitchen')) return;
+    kitchenAbort.current?.abort();
+    const controller = new AbortController();
+    kitchenAbort.current = controller;
     setRecipeBusy(true);
     setRecipe(null);
     setPacked([]);
     void (async () => {
       try {
-        const next = await askGeminiRecipe(plate, chosen);
-        if (!mounted.current) return;
+        const next = await askGeminiRecipe(plate, chosen, controller.signal, (partial) => {
+          if (mounted.current && !controller.signal.aborted) setRecipe(partial);
+        });
+        if (!mounted.current || controller.signal.aborted) return;
         if (next.live && lastAiWasBillable()) {
           spendQuota('kitchen', pro);
           setQuotaTick((tick) => tick + 1);
         }
         setRecipe({ title: next.title, cal: next.cal, protein: next.protein, carbs: next.carbs, fats: next.fats, steps: next.steps, halal: next.halal });
       } catch {
-        if (!mounted.current) return;
+        if (!mounted.current || controller.signal.aborted) return;
         const local = cookFromFridge(plate);
         setRecipe({ ...local, steps: local.steps.slice(0, 4), halal: false });
       } finally {
-        if (mounted.current) setRecipeBusy(false);
+        if (kitchenAbort.current === controller) kitchenAbort.current = null;
+        if (mounted.current) {
+          if (controller.signal.aborted) setRecipe(null);
+          setRecipeBusy(false);
+        }
       }
     })();
   };
@@ -3379,14 +3543,14 @@ export default function Home() {
                   <button type="button" className={`${primaryClass} mt-4 w-full`} disabled={recipeBusy} onClick={() => generateRecipe()}>
                     {recipeBusy ? t('generating') : t('generateRecipe')}
                   </button>
-                  {recipeBusy && !recipe && <p className="mt-3 text-sm font-semibold">{t('generating')}</p>}
+                  {recipeBusy && !recipe && <p className="mt-3 flex items-center gap-2 text-sm font-semibold"><span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>{t('generating')}</p>}
                   {recipe && (
                     <div className="glass-quiet mt-3 rounded-3xl p-4">
                       <div className="flex items-center gap-2">
                         <div className="font-extrabold tracking-[-0.02em]">{recipe.title}</div>
                         {recipe.halal && <span className="rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#047857]">✓ Halal</span>}
                       </div>
-                      {recipe.title !== 'API Error' && (
+                      {recipe.title !== 'API Error' && recipe.cal > 0 && (
                         <>
                           <div className="mt-3 flex flex-wrap gap-1.5">
                             {[
@@ -3426,7 +3590,7 @@ export default function Home() {
                           <li key={`${index}-${step.slice(0, 24)}`}>{step}</li>
                         ))}
                       </ol>
-                      {recipe.title !== 'API Error' && (
+                      {recipe.title !== 'API Error' && recipe.cal > 0 && !recipeBusy && (
                         <button
                           type="button"
                           className={`${primaryClass} mt-4 w-full`}
@@ -3448,6 +3612,9 @@ export default function Home() {
                   <div className="relative mt-3 aspect-[4/3] overflow-hidden rounded-[28px] bg-[#f4f7fb] shadow-[inset_0_0_0_1px_rgba(15,23,42,0.06)]">
                     {scanPreview ? <img src={scanPreview} alt="Selected food" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center px-8 text-center text-sm text-muted">A crisp preview appears the moment you take or pick a photo.</div>}
                     <div className="pointer-events-none absolute inset-4 rounded-[22px] border border-white/80 shadow-[0_0_0_1px_rgba(16,185,129,0.35)]" />
+                    {scanBusy && scanPreview && (
+                      <div className="scan-veil pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true"><div className="scan-laser" /></div>
+                    )}
                   </div>
                   <div className="mt-3 flex gap-2">
                     <button type="button" className={`${primaryClass} min-w-0 flex-1`} disabled={scanBusy} onClick={() => { setScanMode('photo'); cameraInputRef.current?.click(); }}><Glyph name="camera" />{scanBusy ? t('analyzing') : t('takePhoto')}</button>
@@ -3544,6 +3711,7 @@ export default function Home() {
                           </div>
                         ))}
                       </div>
+                      {(scanResult.fiber + scanResult.calcium + scanResult.iron + scanResult.sugar + scanResult.sodium > 0 || scanResult.vitamins.length > 0) && (
                       <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
                         {[
                           ['Fiber', `${scanResult.fiber} g`],
@@ -3559,6 +3727,7 @@ export default function Home() {
                           </div>
                         ))}
                       </div>
+                      )}
                       {scanResult.verdict && <p className="mt-3 text-sm leading-relaxed text-slate-700">{scanResult.verdict}</p>}
                       <DietBadges codes={dietCodes({ name: scanResult.name, halal: scanResult.halal, contains: scanResult.contains })} label={t} />
                       <p className="mt-2 text-sm font-semibold text-slate-700">{smartSwapLine(scanResult)}</p>
@@ -3599,16 +3768,21 @@ export default function Home() {
                     ))}
                   </div>
                   <div ref={chatRef} className="mb-3 max-h-80 space-y-2 overflow-y-auto pe-1">
-                    {store.chat.map((message) => (
-                      <div key={message.id} className={message.sender === 'user' ? 'text-end' : 'text-start'}>
-                        <span className={`inline-block max-w-[90%] rounded-3xl px-3.5 py-2.5 text-start text-sm leading-relaxed ${message.sender === 'user' ? 'btn-primary on-gradient' : 'glass-quiet text-slate-700'}`}>
-                          {message.text === 'Generating...' ? t('generating') : message.text}
-                        </span>
-                        {message.sender === 'ai' && message.text !== 'Generating...' && (
-                          <button type="button" className="mt-1 block text-[10px] font-semibold text-muted underline" onClick={() => reportAi('coach', message.text)}>Report</button>
-                        )}
-                      </div>
-                    ))}
+                    {store.chat.map((message) => {
+                      const live = coachLive !== null && coachLive.id === message.id ? coachLive : null;
+                      const typing = live !== null && live.text === '';
+                      const shown = live ? live.text : message.text === 'Generating...' ? t('generating') : message.text;
+                      return (
+                        <div key={message.id} className={message.sender === 'user' ? 'text-end' : 'text-start'}>
+                          <span className={`inline-block max-w-[90%] rounded-3xl px-3.5 py-2.5 text-start text-sm leading-relaxed ${message.sender === 'user' ? 'btn-primary on-gradient' : 'glass-quiet text-slate-700'}`}>
+                            {typing ? <span className="typing-dots" role="status" aria-label={t('generating')}><i /><i /><i /></span> : shown}
+                          </span>
+                          {message.sender === 'ai' && !live && message.text !== 'Generating...' && (
+                            <button type="button" className="mt-1 block text-[10px] font-semibold text-muted underline" onClick={() => reportAi('coach', message.text)}>Report</button>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                   <form className="flex gap-2" onSubmit={(e: FormEvent) => { e.preventDefault(); sendChat(); }}>
                     <input className={fieldClass} value={chatInput} placeholder={t('coachPlaceholder')} disabled={coachBusy} onChange={(e) => setChatInput(e.target.value)} />
