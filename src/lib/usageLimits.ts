@@ -6,7 +6,7 @@ const QUOTA_KEY = 'fitbite_daily_quota_v1';
 
 const FREE_LIMITS: Record<QuotaKind, number> = {
   scan: 3,
-  coach: 5,
+  coach: 3,
   kitchen: 3,
   challenge: 1,
 };
@@ -63,12 +63,12 @@ export function quotaLeft(kind: QuotaKind, pro: boolean) {
 }
 
 export function canSpend(kind: QuotaKind, pro: boolean) {
-  if (pro || kind === 'coach') return true;
+  if (pro) return true;
   return quotaLeft(kind, pro).left > 0;
 }
 
 export function spendQuota(kind: QuotaKind, pro: boolean) {
-  if (pro || kind === 'coach') return true;
+  if (pro) return true;
   if (!canSpend(kind, pro)) return false;
   const ledger = readLedger();
   ledger[kind] += 1;

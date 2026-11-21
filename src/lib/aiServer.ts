@@ -286,7 +286,7 @@ export async function serverTranscribe(audioBase64: string, mimeType: string) {
   if (data.length < 32 || !gemini) return { text: '' };
   const mime = (mimeType.split(';')[0] || 'audio/webm').trim();
   const body = geminiBody([
-    { text: 'Transcribe this speech exactly. The speaker may use English, Urdu, or Roman Urdu. Return only the spoken words.' },
+    { text: 'Transcribe this speech exactly. The speaker may use English, Arabic, German, French, Spanish, Italian, Urdu, or Roman Urdu. Return only the spoken words.' },
     { inlineData: { mimeType: mime, data } },
   ], 240, 0.1);
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(gemini)}`;

@@ -36,10 +36,22 @@
   gap: 0.375rem;
   overflow-x: auto;
   padding-bottom: 0.25rem;
+  /* The end padding sits inside the fade, so the last chip is never clipped or faded when scrolled to the end. */
+  padding-inline-end: 32px;
+  scroll-padding-inline: 12px;
+  scroll-snap-type: x proximity;
+  scroll-behavior: smooth;
+  overscroll-behavior-x: contain;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
   mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
   -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+}
+
+.chip-row > * {
+  flex-shrink: 0;
+  white-space: nowrap;
+  scroll-snap-align: start;
 }
 
 .chip-row::-webkit-scrollbar {
@@ -370,4 +382,31 @@ nextjs-portal {
     animation: none !important;
     transition: none !important;
   }
+}
+
+
+/* ---- Right-to-left (Arabic) ---------------------------------------------------------------- */
+/* Negative tracking breaks the joined letters of Arabic script, so it is switched off. */
+html[lang='ar'] * {
+  letter-spacing: 0 !important;
+}
+
+[dir='rtl'] .chip-row {
+  mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent);
+  -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent);
+}
+
+[dir='rtl'] .text-left { text-align: right; }
+[dir='rtl'] .text-right { text-align: left; }
+[dir='rtl'] .ml-auto { margin-left: 0; margin-right: auto; }
+[dir='rtl'] .ml-1 { margin-left: 0; margin-right: 0.25rem; }
+[dir='rtl'] .pl-4 { padding-left: 0; padding-right: 1rem; }
+[dir='rtl'] .rtl-flip { display: inline-block; transform: scaleX(-1); }
+
+/* Sliders, numbers, and units keep their natural left-to-right reading order. */
+[dir='rtl'] input[type='range'],
+[dir='rtl'] input[inputmode='numeric'],
+[dir='rtl'] input[inputmode='decimal'],
+[dir='rtl'] input[type='date'] {
+  direction: ltr;
 }

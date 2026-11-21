@@ -8,12 +8,13 @@ export type DietPrefs = {
   glutenFree: boolean;
   lactoseFree: boolean;
   nutFree: boolean;
+  desiFit: boolean;
 };
 
-export const DIET_FLAGS = ['halal', 'vegan', 'vegetarian', 'glutenFree', 'lactoseFree', 'nutFree'] as const;
+export const DIET_FLAGS = ['halal', 'vegan', 'vegetarian', 'glutenFree', 'desiFit', 'lactoseFree', 'nutFree'] as const;
 
 export function emptyDiet(): DietPrefs {
-  return { halal: false, vegan: false, vegetarian: false, glutenFree: false, lactoseFree: false, nutFree: false };
+  return { halal: false, vegan: false, vegetarian: false, glutenFree: false, lactoseFree: false, nutFree: false, desiFit: false };
 }
 
 export function readDiet(): DietPrefs {
@@ -55,7 +56,11 @@ export function dietRuleLine(prefs: DietPrefs) {
     prefs.lactoseFree ? 'lactose-free' : '',
     prefs.nutFree ? 'nut-free' : '',
   ].filter(Boolean);
-  return rules.length ? `Dietary rules: ${rules.join(', ')}. Do not suggest foods that conflict.` : '';
+  const lines: string[] = [];
+  if (rules.length) lines.push(`Dietary rules: ${rules.join(', ')}. Do not suggest foods that conflict.`);
+  if (prefs.halal) lines.push('Halal is strict: no pork, alcohol, gelatin, or non-halal meat in any answer, recipe, or scan verdict. Say when halal status cannot be confirmed.');
+  if (prefs.desiFit) lines.push('Desi Fit: prefer South Asian home-style food (roti, daal, sabzi, grilled tikka, raita) with lean, portion-aware, high-protein versions.');
+  return lines.join(' ');
 }
 
 export type DietCode = 'match' | 'halal' | 'notHalal' | 'gluten' | 'milk' | 'nuts' | 'notVegan' | 'notVegetarian' | 'halalUnknown';

@@ -1,8 +1,8 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
 /**
- * Drop hosted HTTPS URLs here before Play Console upload.
- * The defaults open the static pages shipped in `public/`.
+ * Hosted HTTPS pages for the Privacy Policy, Terms of Use, and account deletion.
+ * The app shows the full text in-app and links here for the online copy.
  */
 export const APP_LEGAL_URLS = {
   privacy: 'https://fitbite-pro.vercel.app/privacy',

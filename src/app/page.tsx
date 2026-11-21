@@ -8,9 +8,12 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { BarcodeScanModal } from '@/components/BarcodeScanModal';
 import { analyzeFoodPhoto, askNeural, engineRoute as readEngineRoute, lastAiWasBillable, localWellnessChallenge, parseJsonRecord, parseScanNutrition, preferencePrompt, recipeFromGemini, suggestDailyChallenge, transcribeSpeech, type WellnessChallenge } from '@/lib/aiEngine';
 import { AI_CONSENT_KEY, DIET_KEY, DIET_FLAGS, dietRuleLine, emptyDiet, judgeDiet, readAiConsent, readDiet, writeAiConsent, writeDiet, type DietCode, type DietPrefs } from '@/lib/dietProfile';
-import { LANG_KEY, LANGS, languageName, readLang, translate, writeLang, type CopyKey, type Lang } from '@/lib/i18n';
+import { LANG_KEY, LANGS, aiLanguageName, applyDocumentLanguage, languageName, readLang, translate, writeLang, type CopyKey, type Lang } from '@/lib/i18n';
 import { lookupOpenFoodFacts, OFF_CACHE_KEY, type OffProduct } from '@/lib/openFoodFacts';
-import { readUserSubscription, restoreFitBitePro, subscribeFitBitePro, writeUserSubscription, type ProPlan } from '@/lib/billingService';
+import { refreshSubscription, readUserSubscription, SUBSCRIPTION_KEY, writeUserSubscription } from '@/lib/billing';
+import { ProPaywall, type PaywallReason } from '@/components/ProPaywall';
+import { LegalModal, type LegalKind } from '@/components/LegalModal';
+import { UNITS_KEY, formatHeightUnits, formatLiftWeight, formatWater, formatWaterGoal, formatWeight, inToCm, kgToLb, lbToKg, readUnits, round as roundTo, waterGoalL, waterStepL, waterStepLabel, weightUnit, writeUnits, type UnitSystem } from '@/lib/units';
 import { QUOTA_STORAGE_KEY, canSpend, isProPlan, quotaLeft, spendQuota, type QuotaKind } from '@/lib/usageLimits';
 
 type FlowStep = 'welcome' | 'auth' | 'profile' | 'device' | 'app';
@@ -289,8 +292,6 @@ const VAULT_KEY = 'fitbite_vault_key';
 const LEGACY_KEY = 'fitbite_pro_clean_v2';
 const CAL_GOAL = 2100;
 const STEP_GOAL = 10000;
-const WATER_GOAL = 3;
-const WELLNESS_NOTE = 'For general wellness and fitness tracking only — not a medical device. AI nutrition and Halal indicators are estimates; always verify product labels.';
 const SAFE_TOP = 'pt-[max(env(safe-area-inset-top),40px)]';
 
 const COACH_PROMPTS = [
@@ -309,9 +310,6 @@ function smartSwapLine(card: { protein: number; sugar: number; fat: number; verd
   if (card.protein < 12) return 'Smart Swap: add eggs, lentils, yogurt, or chicken on the side.';
   if (card.fat >= 22) return 'Smart Swap: serve a smaller portion with extra vegetables.';
   return 'Smart Swap: keep this plate and add a glass of water.';
-}
-function legalTarget(href: string) {
-  return href.startsWith('http') ? { target: '_blank' as const, rel: 'noopener noreferrer' } : {};
 }
 const CHALLENGE_KEY = 'fitbite_daily_challenge_v1';
 
@@ -451,9 +449,10 @@ function emptyRecovery(): RecoveryClock {
   return { Chest: 0, Back: 0, Legs: 0, Shoulders: 0, Arms: 0 };
 }
 
-function estimate1Rm(weight: number, reps: number) {
-  if (reps <= 1) return Math.round(weight);
-  return Math.round(weight * (1 + reps / 30));
+/** Epley estimate. Weights are kg internally, kept to two decimals so pounds convert back cleanly. */
+function estimate1Rm(weightKg: number, reps: number) {
+  const value = reps <= 1 ? weightKg : weightKg * (1 + reps / 30);
+  return Math.round(value * 100) / 100;
 }
 
 const CARDIO_SPORTS = new Set(['Run', 'Walk', 'Bike', 'Hike']);
@@ -710,12 +709,6 @@ function emailOk(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value.trim());
 }
 
-function trialDaysLeft(startedAt: number, forced: boolean) {
-  if (forced) return 0;
-  const elapsed = Date.now() - startedAt;
-  return Math.max(0, Math.ceil((7 * 86400000 - elapsed) / 86400000));
-}
-
 function maintainKcal(weightKg: number, heightCm: number, age: number, gender: 'Male' | 'Female') {
   const bmr = 10 * weightKg + 6.25 * heightCm - 5 * age + (gender === 'Female' ? -161 : 5);
   return Math.max(1200, Math.round(bmr * 1.45));
@@ -885,17 +878,6 @@ async function readStoredText() {
   if (!iv || !cipher) return '';
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64ToBytes(iv) }, await vaultCryptoKey(), b64ToBytes(cipher));
   return new TextDecoder().decode(plain);
-}
-
-function readStore(): Store | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY) ?? window.localStorage.getItem(LEGACY_KEY);
-    if (!raw || raw.startsWith('enc:')) return null;
-    return sanitize(JSON.parse(raw) as unknown);
-  } catch {
-    return null;
-  }
 }
 
 function hashString(value: string) {
@@ -1143,15 +1125,15 @@ function ageOf(birthday: string) {
   return Math.max(1, age);
 }
 
-function formatHeight(cm: number, unit: HeightUnit) {
-  if (unit === 'cm') return `${Math.round(cm)} cm`;
-  const totalIn = Math.round(cm / 2.54);
-  return `${Math.floor(totalIn / 12)} ft ${totalIn % 12} in`;
+function nudgeHeightCm(cm: number, units: UnitSystem, dir: 1 | -1) {
+  const next = units === 'imperial' ? inToCm(Math.round(cm / 2.54) + dir) : Math.round(cm) + dir;
+  return Math.min(220, Math.max(120, roundTo(next, 1)));
 }
 
-function nudgeHeight(cm: number, unit: HeightUnit, dir: 1 | -1) {
-  const delta = unit === 'cm' ? 1 : 2.54;
-  return Math.min(220, Math.max(120, Math.round((cm + dir * delta) * 10) / 10));
+/** Body weight is stored in kg. Imperial users move in whole pounds. */
+function nudgeWeightKg(kg: number, units: UnitSystem, dir: 1 | -1) {
+  const next = units === 'imperial' ? roundTo(lbToKg(Math.round(kgToLb(kg)) + dir), 3) : roundTo(kg + dir * 0.5, 1);
+  return Math.min(180, Math.max(35, next));
 }
 
 function clockTime(value: string) {
@@ -1252,13 +1234,14 @@ function coachContextLine(ctx: CoachContext) {
 
 function coachSystemPrompt(ctx: CoachContext) {
   const stats = coachContextLine(ctx);
+  const units = readUnits();
   return [
     'You are FitBite Pro’s coach. Direct answer only.',
     'Reply in the user’s exact language and script. Maximum 3 short sentences or 3 bullets. No essay.',
-    `Athlete: ${ctx.name}, ${ctx.gender}, age ${ctx.age}, ${Math.round(ctx.heightCm)} cm, ${ctx.weightKg.toFixed(1)} kg, BMI ${stats.bmi.toFixed(1)}.`,
-    `Today: ${ctx.calories} of ${CAL_GOAL} kcal eaten, ${ctx.protein}g protein, ${ctx.carbs}g carbs, ${ctx.fats}g fat, ${ctx.steps} of ${STEP_GOAL} steps, ${ctx.waterL.toFixed(2)} of ${WATER_GOAL.toFixed(2)} L water, about ${Math.round(ctx.burned)} kcal burned, ${ctx.sleepHrs} h sleep.`,
-    `Targets: maintenance about ${stats.maintain} kcal, a steady cut near ${stats.cut} kcal, protein about ${stats.proteinGoal}g.`,
-    preferencePrompt(languageName(readLang()), dietRuleLine(readDiet())),
+    `Athlete: ${ctx.name}, ${ctx.gender}, age ${ctx.age}, ${formatHeightUnits(ctx.heightCm, units)}, ${formatWeight(ctx.weightKg, units)}, BMI ${stats.bmi.toFixed(1)}.`,
+    `Today: ${ctx.calories} of ${CAL_GOAL} kcal eaten, ${ctx.protein}g protein, ${ctx.carbs}g carbs, ${ctx.fats}g fat, ${ctx.steps} of ${STEP_GOAL} steps, ${formatWater(ctx.waterL, units)} of ${formatWaterGoal(units)} water, about ${Math.round(ctx.burned)} kcal burned, ${ctx.sleepHrs} h sleep.`,
+    `Targets: maintenance about ${stats.maintain} kcal, a steady cut near ${stats.cut} kcal, protein about ${stats.proteinGoal} g.`,
+    preferencePrompt(),
   ].join('\n');
 }
 
@@ -1289,9 +1272,10 @@ async function pinDigest(pin: string) {
 function localCoachFromPrompt(prompt: string) {
   const user = (prompt.split('User:').pop() || '').trim();
   const today = (prompt.match(/Today: ([^\n]+)/) || [])[1] || '';
+  if (readLang() === 'ar') return 'ركّز اليوم على إكمال البروتين وشرب الماء وإبقاء السعرات ضمن هدفك. ليسدّ طعامك القادم أكبر فجوة.';
   if (/[\u0600-\u06FF]/.test(user)) return 'آج پروٹین پورا کریں، پانی پئیں، اور کیلوریز ہدف کے اندر رکھیں۔ اگلا کھانا سب سے بڑے فرق کو بند کرے۔';
   if (/\b(kya|kaise|karun|karo|hai|nahi|mujhe|mera)\b/i.test(user)) return 'Seedha jawab: protein complete karo, pani pio, aur calories goal ke andar rakho. Agla meal sab se bari kami pur kare.';
-  if (/water|hydrat/i.test(user)) return 'Drink toward 3.00 L. One glass now if you are still under the line.';
+  if (/water|hydrat/i.test(user)) return `Drink toward ${formatWaterGoal(readUnits())}. One glass now if you are still under the line.`;
   if (/protein/i.test(user)) return 'Close the protein gap with one lean serving. The target is already on your profile.';
   if (/workout|run|gym|bench|squat/i.test(user)) return 'Do the session you planned. Stop with one rep left in reserve.';
   return `Stay with today’s targets. ${today || 'Calories, protein, and water are the three numbers that matter.'} Let the next meal close the biggest gap.`;
@@ -1347,29 +1331,9 @@ function scanPrompt(note: string, extra: string) {
     'Set halal true only when the food is verified halal. Otherwise false.',
     'contains lists allergen words you can see, such as gluten, milk, nuts, pork. Otherwise [].',
     'verdict is one short sentence.',
-    preferencePrompt(languageName(readLang()), dietRuleLine(readDiet())),
+    preferencePrompt(),
     '{"name":"","servingG":0,"score":7,"calories":0,"carbs":0,"protein":0,"fat":0,"fiber":0,"calcium":0,"iron":0,"sugar":0,"sodium":0,"vitamins":["Vitamin C"],"halal":false,"contains":[],"verdict":""}',
   ].join('\n');
-}
-
-function offBrief(product: { product_name?: string; brands?: string; serving_size?: string; nutriments?: Record<string, unknown> }) {
-  const n = product.nutriments ?? {};
-  const pick = (key: string) => (typeof n[key] === 'number' ? String(n[key]) : '');
-  return [
-    `Name: ${product.product_name ?? ''}`,
-    `Brand: ${product.brands ?? ''}`,
-    `Serving: ${product.serving_size ?? ''}`,
-    'OpenFoodFacts values are per 100g. Minerals may be in grams; convert those to mg.',
-    `kcal ${pick('energy-kcal_100g')} carbs ${pick('carbohydrates_100g')} protein ${pick('proteins_100g')} fat ${pick('fat_100g')} fiber ${pick('fiber_100g')} calcium ${pick('calcium_100g')} iron ${pick('iron_100g')} sugar ${pick('sugars_100g')} sodium ${pick('sodium_100g')}`,
-  ].join('\n');
-}
-
-async function lookupBarcode(code: string) {
-  const response = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json`);
-  if (!response.ok) return `Barcode ${code}. OpenFoodFacts returned ${response.status}.`;
-  const data = (await response.json()) as { status?: number; product?: { product_name?: string; brands?: string; serving_size?: string; nutriments?: Record<string, unknown> } };
-  if (data.status !== 1 || !data.product) return `Barcode ${code}. No OpenFoodFacts product. Estimate from the code only if you know it.`;
-  return offBrief(data.product);
 }
 
 async function readBarcode(source: CanvasImageSource) {
@@ -1404,7 +1368,7 @@ async function askGeminiRecipe(names: string[], craving = '') {
     'One short recipe using only these ingredients:',
     names.join(', '),
     craving ? `Style: ${craving}. Keep it gentle everyday food, not a medical plan.` : 'Keep it gentle everyday food.',
-    preferencePrompt(languageName(readLang()), dietRuleLine(readDiet())),
+    preferencePrompt(),
     'Max 4 one-line steps. JSON only:',
     '{"title":"","calories":0,"protein":0,"carbs":0,"fats":0,"halal":false,"steps":["","","",""]}',
   ].join('\n');
@@ -1460,12 +1424,12 @@ function Icon({ name, className = 'h-5 w-5' }: { name: 'today' | 'health' | 'ai'
   );
 }
 
-function ActivityRings({ calories, steps, water, draw, night = false }: { calories: number; steps: number; water: number; draw: boolean; night?: boolean }) {
+function ActivityRings({ calories, steps, water, waterGoal, draw, night = false }: { calories: number; steps: number; water: number; waterGoal: number; draw: boolean; night?: boolean }) {
   const stroke = 12;
   const rings = [
     { id: 'cal', r: 76, pct: calories / CAL_GOAL, track: night ? 'rgba(255,45,85,0.18)' : '#ffe3ea', from: '#ff7a93', to: '#ff2d55', label: 'Calories' },
     { id: 'step', r: 58, pct: steps / STEP_GOAL, track: night ? 'rgba(34,197,94,0.16)' : '#ddf8e6', from: '#62e08c', to: '#22c55e', label: 'Steps' },
-    { id: 'water', r: 40, pct: water / WATER_GOAL, track: night ? 'rgba(14,165,233,0.18)' : '#dff4ff', from: '#7dd7ff', to: '#0ea5e9', label: 'Water' },
+    { id: 'water', r: 40, pct: water / waterGoal, track: night ? 'rgba(14,165,233,0.18)' : '#dff4ff', from: '#7dd7ff', to: '#0ea5e9', label: 'Water' },
   ];
   return (
     <svg viewBox="0 0 200 200" className="h-[228px] w-[228px]" aria-hidden="true">
@@ -1614,17 +1578,6 @@ function WatchFace({ kind, bpm, alert, compact = false, live = true }: { kind: W
   );
 }
 
-function Battery({ value }: { value: number }) {
-  return (
-    <span className="inline-flex items-center gap-2 text-xs text-white/70">
-      <span className="relative h-2.5 w-9 rounded-full bg-white/10">
-        <span className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${value}%`, background: value < 20 ? '#ff375f' : '#30d158' }} />
-      </span>
-      {Math.round(value)}%
-    </span>
-  );
-}
-
 type WebSpeech = {
   lang: string;
   continuous: boolean;
@@ -1650,8 +1603,9 @@ export default function Home() {
   const [scanNotice, setScanNotice] = useState('');
   const [scanPreview, setScanPreview] = useState<string | null>(null);
   const [showPaywall, setShowPaywall] = useState(false);
-  const [proPlan, setProPlan] = useState<ProPlan>('yearly');
-  const [fairUseNote, setFairUseNote] = useState('');
+  const [paywallReason, setPaywallReason] = useState<PaywallReason>(null);
+  const [legal, setLegal] = useState<LegalKind | null>(null);
+  const [units, setUnits] = useState<UnitSystem>('metric');
   const [quotaTick, setQuotaTick] = useState(0);
   const [craving, setCraving] = useState('');
   const [packed, setPacked] = useState<number[]>([]);
@@ -1668,9 +1622,8 @@ export default function Home() {
   const [feedback, setFeedback] = useState('');
   const [rating, setRating] = useState(5);
   const [feedbackSent, setFeedbackSent] = useState(false);
-  const [updateNote, setUpdateNote] = useState('');
+  const [updateNote] = useState('');
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [restoreNote, setRestoreNote] = useState('');
   const [lang, setLang] = useState<Lang>('en');
   const [diet, setDiet] = useState<DietPrefs>(emptyDiet());
   const [aiConsent, setAiConsent] = useState(true);
@@ -1752,25 +1705,25 @@ export default function Home() {
   };
 
   const eraseLocalAccount = () => {
-    window.localStorage.removeItem(STORAGE_KEY);
-    window.localStorage.removeItem(LEGACY_KEY);
-    window.localStorage.removeItem(PREFS_KEY);
-    window.localStorage.removeItem(VAULT_KEY);
-    window.localStorage.removeItem('fitbite_ai_cache_v1');
-    window.localStorage.removeItem('fitbite_ai_reports_v1');
-    window.localStorage.removeItem(CHALLENGE_KEY);
-    window.localStorage.removeItem(QUOTA_STORAGE_KEY);
-    window.localStorage.removeItem(DIET_KEY);
-    window.localStorage.removeItem(LANG_KEY);
-    window.localStorage.removeItem(AI_CONSENT_KEY);
-    window.localStorage.removeItem(OFF_CACHE_KEY);
-    window.localStorage.removeItem(LAST_WATCH_KEY);
+    nativeBle()?.stopScan?.();
     nativeBle()?.disconnectWatch?.();
+    preserveStore.current = true;
+    for (const key of [STORAGE_KEY, LEGACY_KEY, PREFS_KEY, VAULT_KEY, CHALLENGE_KEY, QUOTA_STORAGE_KEY, DIET_KEY, LANG_KEY, UNITS_KEY, AI_CONSENT_KEY, OFF_CACHE_KEY, LAST_WATCH_KEY, SUBSCRIPTION_KEY, 'fitbite_ai_cache_v1', 'fitbite_ai_reports_v1']) {
+      window.localStorage.removeItem(key);
+    }
+    try {
+      // Every remaining key, including chat logs, the AI cache, and pairing records, goes with the account.
+      window.localStorage.clear();
+      window.sessionStorage.clear();
+    } catch {
+      /* The keys above are already gone. */
+    }
     window.location.reload();
   };
 
   const backState = useRef({
     showPaywall: false,
+    legal: null as LegalKind | null,
     desk: null as typeof desk,
     scanOpen: false,
     showGps: false,
@@ -1781,7 +1734,7 @@ export default function Home() {
     flowStep: store.flowStep,
     activeTab,
   });
-  backState.current = { showPaywall, desk, scanOpen, showGps, sleepOpen, showMealLog, showDeleteConfirm, barcodeOpen, flowStep: store.flowStep, activeTab };
+  backState.current = { showPaywall, legal, desk, scanOpen, showGps, sleepOpen, showMealLog, showDeleteConfirm, barcodeOpen, flowStep: store.flowStep, activeTab };
 
   useEffect(() => {
     if (!Capacitor.isNativePlatform()) return;
@@ -1789,6 +1742,7 @@ export default function Home() {
       const snap = backState.current;
       if (snap.barcodeOpen) { setBarcodeOpen(false); return; }
       if (snap.showDeleteConfirm) { setShowDeleteConfirm(false); return; }
+      if (snap.legal) { setLegal(null); return; }
       if (snap.showPaywall) { setShowPaywall(false); return; }
       if (snap.desk) { setDesk(null); return; }
       if (snap.scanOpen) { setScanOpen(false); return; }
@@ -1804,6 +1758,9 @@ export default function Home() {
 
   useEffect(() => {
     setLang(readLang());
+    const savedUnits = readUnits();
+    setUnits(savedUnits);
+    if (savedUnits === 'imperial') setLiftWeight('175');
     setDiet(readDiet());
     setAiConsent(readAiConsent());
     setLastWatch(readLastWatch());
@@ -1821,6 +1778,16 @@ export default function Home() {
     return () => {
       delete bridge.fitbiteBle;
     };
+  }, []);
+
+  useEffect(() => {
+    applyDocumentLanguage(lang);
+  }, [lang]);
+
+  useEffect(() => {
+    void refreshSubscription().then((subscription) => {
+      if (subscription) setStore((s) => (s.proActive === subscription.isPro ? s : { ...s, proActive: subscription.isPro }));
+    });
   }, []);
 
   useEffect(() => {
@@ -2096,7 +2063,7 @@ export default function Home() {
     writeSavedChallenge(first);
     let cancel = false;
     if (canSpend('challenge', isProPlan(store.proActive))) {
-      void suggestDailyChallenge({ waterL: store.waterL, meals: store.meals.length, workouts: store.workouts.length, seed, language: languageName(readLang()), diet: dietRuleLine(readDiet()) }).then((next) => {
+      void suggestDailyChallenge({ waterL: store.waterL, meals: store.meals.length, workouts: store.workouts.length, seed, language: aiLanguageName(readLang()), diet: dietRuleLine(readDiet()) }).then((next) => {
         if (cancel) return;
         if (lastAiWasBillable()) {
           spendQuota('challenge', isProPlan(store.proActive));
@@ -2122,7 +2089,7 @@ export default function Home() {
     writeSavedChallenge(immediate);
     const previousTitle = challenge.title;
     if (!canSpend('challenge', isProPlan(store.proActive))) return;
-    void suggestDailyChallenge({ waterL: store.waterL, meals: store.meals.length, workouts: store.workouts.length, seed, language: languageName(readLang()), diet: dietRuleLine(readDiet()) }).then((next) => {
+    void suggestDailyChallenge({ waterL: store.waterL, meals: store.meals.length, workouts: store.workouts.length, seed, language: aiLanguageName(readLang()), diet: dietRuleLine(readDiet()) }).then((next) => {
       if (lastAiWasBillable() && next.title.toLowerCase() !== previousTitle.toLowerCase()) {
         spendQuota('challenge', isProPlan(store.proActive));
         setQuotaTick((tick) => tick + 1);
@@ -2213,15 +2180,28 @@ export default function Home() {
 
   const isPro = isProPlan(store.proActive);
   const pro = isPro;
-  const t = (key: CopyKey) => translate(lang, key);
+  const t = (key: CopyKey, vars?: Record<string, string | number>) => translate(lang, key, vars);
   const dietCodes = (input: { name: string; allergens?: string[]; analysis?: string[]; halal?: boolean | null; contains?: string[] }) => judgeDiet(diet, input);
+  const chooseUnits = (next: UnitSystem) => {
+    if (next === units) return;
+    const typed = Number(liftWeight);
+    if (Number.isFinite(typed) && typed > 0) {
+      const kg = units === 'imperial' ? lbToKg(typed) : typed;
+      setLiftWeight(String(next === 'imperial' ? Math.round(kgToLb(kg)) : roundTo(kg, 1)));
+    }
+    setUnits(next);
+    writeUnits(next);
+  };
+
+  const chooseLang = (next: Lang) => {
+    setLang(next);
+    writeLang(next);
+    applyDocumentLanguage(next);
+  };
+
   const blockForQuota = (kind: QuotaKind) => {
     if (canSpend(kind, pro)) return false;
-    if (pro) {
-      setFairUseNote('Daily fair-use limit reached — resets at midnight');
-      return true;
-    }
-    setFairUseNote('');
+    setPaywallReason(kind === 'scan' || kind === 'coach' || kind === 'kitchen' ? kind : null);
     setShowPaywall(true);
     return true;
   };
@@ -2235,6 +2215,7 @@ export default function Home() {
   const sendChat = (preset?: string) => {
     const text = (preset ?? chatInput).trim();
     if (!text || coachBusy) return;
+    if (blockForQuota('coach')) return;
     const ctx = coachContext();
     const prompt = `${coachSystemPrompt(ctx)}\n\nUser: ${text}`;
     const userId = nextId();
@@ -2249,6 +2230,10 @@ export default function Home() {
       let reply = localCoachFromPrompt(prompt);
       try {
         reply = await askGeminiText(prompt);
+        if (lastAiWasBillable()) {
+          spendQuota('coach', pro);
+          if (mounted.current) setQuotaTick((tick) => tick + 1);
+        }
       } catch {
         reply = localCoachFromPrompt(prompt);
       } finally {
@@ -2413,25 +2398,27 @@ export default function Home() {
   };
 
   const addWater = () => {
-    setStore((s) => ({ ...s, waterL: Math.round((s.waterL + 0.25) * 100) / 100 }));
+    const step = waterStepL(units);
+    setStore((s) => ({ ...s, waterL: roundTo(s.waterL + step, 4) }));
     tapHaptic();
     setWaterPulse((n) => n + 1);
     window.setTimeout(() => setWaterPulse(0), 1000);
-    showToast(translate(readLang(), 'addedWater'));
+    showToast(t('addedWater', { amount: waterStepLabel(units) }));
   };
 
   const removeWater = () => {
-    if (store.waterL <= 0) {
-      showToast('Water is already at 0.00 L');
+    if (store.waterL <= 0.0001) {
+      showToast(t('waterAtZero'));
       return;
     }
-    setStore((s) => ({ ...s, waterL: Math.max(0, Math.round((s.waterL - 0.25) * 100) / 100) }));
-    showToast('Removed 250 ml');
+    const step = waterStepL(units);
+    setStore((s) => ({ ...s, waterL: Math.max(0, roundTo(s.waterL - step, 4)) }));
+    showToast(t('removedWater', { amount: waterStepLabel(units) }));
   };
 
   const resetWater = () => {
     setStore((s) => ({ ...s, waterL: 0 }));
-    showToast('Water reset to 0.00 L');
+    showToast(t('waterReset'));
   };
 
   const pairDiscoveredWatch = (name: string, brand: string, mac?: string) => {
@@ -2649,19 +2636,19 @@ export default function Home() {
 
   const openPro = () => {
     if (isPro) return;
-    setRestoreNote('');
+    setPaywallReason(null);
     setShowPaywall(true);
   };
 
+  /** The Me banner: sells the plans to free users and shows plan status and management to Pro users. */
   const openSubscription = () => {
-    const saved = readUserSubscription();
-    if (saved.plan) setProPlan(saved.plan);
-    setRestoreNote('');
+    setPaywallReason(null);
     setShowPaywall(true);
   };
 
   const saveLift = () => {
-    const weight = Number(liftWeight);
+    const typed = Number(liftWeight);
+    const weight = Math.round((units === 'imperial' ? lbToKg(typed) : typed) * 100) / 100;
     const reps = Math.round(Number(liftReps));
     if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || reps < 1 || reps > 30) {
       showToast('Enter a weight and 1–30 reps');
@@ -2669,7 +2656,7 @@ export default function Home() {
     }
     const entry: LiftLog = { id: nextId(), lift: liftName, weight, reps, oneRm: estimate1Rm(weight, reps), at: new Date().toISOString() };
     setStore((s) => (s.lifts.some((lift) => lift.id === entry.id) ? s : { ...s, lifts: [entry, ...s.lifts].slice(0, 30) }));
-    showToast(`${entry.lift} estimated 1RM · ${entry.oneRm} kg`);
+    showToast(`${entry.lift} estimated 1RM · ${formatLiftWeight(entry.oneRm, units)}`);
   };
 
   const music = <MusicHub />;
@@ -2763,7 +2750,7 @@ export default function Home() {
   const fuelShift = (store.sessionFocus === 'Pull' ? 1 : store.sessionFocus === 'Legs' ? 2 : 0) + plateCursor;
   const localPre = fuel.pre[fuelShift % fuel.pre.length];
   const localPost = fuel.post[fuelShift % fuel.post.length];
-  const fuelKey = `${store.trainingGoal}|${store.sessionFocus}|${store.weightKg.toFixed(0)}|${plateCursor}`;
+  const fuelKey = `${store.trainingGoal}|${store.sessionFocus}|${store.weightKg.toFixed(0)}|${plateCursor}|${units}|${lang}`;
   const prePlate = fuelLive?.key === fuelKey ? fuelLive.pre : localPre;
   const postPlate = fuelLive?.key === fuelKey ? fuelLive.post : localPost;
 
@@ -2776,7 +2763,7 @@ export default function Home() {
     const focus = store.sessionFocus;
     const weight = store.weightKg;
     const variation = plateCursor;
-    const key = `${goal}|${focus}|${weight.toFixed(0)}|${variation}`;
+    const key = `${goal}|${focus}|${weight.toFixed(0)}|${variation}|${units}|${lang}`;
     const shift = (focus === 'Pull' ? 1 : focus === 'Legs' ? 2 : 0) + variation;
     const menu = FUEL[goal];
     const fallbackPre = menu.pre[shift % menu.pre.length];
@@ -2784,9 +2771,9 @@ export default function Home() {
     let cancel = false;
     setFuelBusy(true);
     const prompt = [
-      `Training meals for a ${weight.toFixed(0)} kg person.`,
+      `Training meals for a person weighing ${formatWeight(weight, readUnits(), 0)}.`,
       `Goal: ${goal === 'fat' ? 'fat loss' : 'muscle gain'}. Session: ${focus}. Variation ${variation + 1}.`,
-      preferencePrompt(languageName(readLang()), dietRuleLine(readDiet())),
+      preferencePrompt(),
       'One plate for 1-2 hours before training and one plate after training. Use exact gram portions. JSON only:',
       '{"pre":{"title":"","items":"60g oats · 1 banana","why":"","calories":0,"protein":0,"carbs":0,"fats":0},"post":{"title":"","items":"150g chicken · 180g rice","why":"","calories":0,"protein":0,"carbs":0,"fats":0}}',
     ].join('\n');
@@ -2808,18 +2795,22 @@ export default function Home() {
     }).finally(() => {
       if (!cancel) setFuelBusy(false);
     });
-    return () => { cancel = true; };
-  }, [hydrated, activeTab, store.trainingGoal, store.sessionFocus, store.weightKg, plateCursor, pro]);
+    return () => {
+      cancel = true;
+      setFuelBusy(false);
+    };
+  }, [hydrated, activeTab, store.trainingGoal, store.sessionFocus, store.weightKg, plateCursor, pro, units, lang]);
   const typedWeight = Number(liftWeight);
+  const typedWeightKg = units === 'imperial' ? lbToKg(typedWeight) : typedWeight;
   const typedReps = Math.round(Number(liftReps));
-  const previewRm = Number.isFinite(typedWeight) && typedWeight > 0 && typedReps >= 1 && typedReps <= 30 ? estimate1Rm(typedWeight, typedReps) : null;
+  const previewRm = Number.isFinite(typedWeightKg) && typedWeightKg > 0 && typedReps >= 1 && typedReps <= 30 ? estimate1Rm(typedWeightKg, typedReps) : null;
   const bestLifts = LIFTS.map((name) => {
     const logs = store.lifts.filter((lift) => lift.lift === name);
     const best = logs.reduce((top, lift) => Math.max(top, lift.oneRm), 0);
     return { name, best, latest: logs[0] };
   });
   const hour = new Date().getHours();
-  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  const greeting = hour < 12 ? t('greetMorning') : hour < 17 ? t('greetAfternoon') : t('greetEvening');
   const firstName = store.userName.trim().split(/\s+/)[0] || 'there';
   const kcalLeft = Math.max(0, CAL_GOAL - eaten.calories);
   const fastingElapsed = store.isFasting && store.fastingStartedAt ? Math.max(0, Math.floor((nowTick - store.fastingStartedAt) / 1000)) : 0;
@@ -2871,7 +2862,7 @@ export default function Home() {
           <div className="text-center">
             <div className="glass mx-auto mb-8 grid h-60 w-60 place-items-center rounded-full">
               <div className="scale-[0.82]">
-                <ActivityRings calories={1180} steps={6840} water={1.75} draw />
+                <ActivityRings calories={1180} steps={6840} water={1.75} waterGoal={3} draw />
               </div>
             </div>
             <h1 className="text-[32px] leading-[1.05] font-black tracking-[-0.045em]">{welcomeSlide === 0 ? 'Three rings. One quiet day.' : 'Train, coach, and wear it.'}</h1>
@@ -2966,22 +2957,22 @@ export default function Home() {
           </label>
           <div className="card mt-3 p-4">
             <div className="flex items-center justify-between">
-              <span className="text-[11px] font-bold tracking-[0.14em] text-muted">HEIGHT</span>
-              <span className="text-sm font-black">{formatHeight(store.heightCm, store.heightUnit)}</span>
+              <span className="text-[11px] font-bold tracking-[0.14em] text-muted uppercase">{t('height')}</span>
+              <span className="text-sm font-black tabular-nums" dir="ltr">{formatHeightUnits(store.heightCm, units)}</span>
             </div>
-            <input className="mt-3 w-full accent-[#0ea5e9]" type="range" min={120} max={220} value={store.heightCm} onChange={(e) => patch({ heightCm: Number(e.target.value), heightUnit: 'cm' })} />
+            <input className="mt-3 w-full accent-[#0ea5e9]" type="range" aria-label={t('height')} min={units === 'imperial' ? 48 : 120} max={units === 'imperial' ? 86 : 220} value={units === 'imperial' ? Math.round(store.heightCm / 2.54) : Math.round(store.heightCm)} onChange={(e) => patch({ heightCm: units === 'imperial' ? roundTo(inToCm(Number(e.target.value)), 1) : Number(e.target.value) })} />
             <div className="mt-2 flex items-center justify-between gap-2">
-              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Decrease height" onClick={() => patch({ heightCm: nudgeHeight(store.heightCm, 'cm', -1) })}>−</button>
-              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Increase height" onClick={() => patch({ heightCm: nudgeHeight(store.heightCm, 'cm', 1) })}>+</button>
+              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Decrease height" onClick={() => patch({ heightCm: nudgeHeightCm(store.heightCm, units, -1) })}>−</button>
+              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Increase height" onClick={() => patch({ heightCm: nudgeHeightCm(store.heightCm, units, 1) })}>+</button>
             </div>
             <div className="mt-4 flex items-center justify-between">
-              <span className="text-[11px] font-bold tracking-[0.14em] text-muted">WEIGHT</span>
-              <span className="text-sm font-black">{store.weightKg.toFixed(1)} kg</span>
+              <span className="text-[11px] font-bold tracking-[0.14em] text-muted uppercase">{t('weight')}</span>
+              <span className="text-sm font-black tabular-nums" dir="ltr">{formatWeight(store.weightKg, units, units === 'imperial' ? 0 : 1)}</span>
             </div>
-            <input className="mt-3 w-full accent-[#8b5cf6]" type="range" min={35} max={180} step={0.5} value={store.weightKg} onChange={(e) => patch({ weightKg: Number(e.target.value) })} />
+            <input className="mt-3 w-full accent-[#8b5cf6]" type="range" aria-label={t('weight')} min={units === 'imperial' ? 78 : 35} max={units === 'imperial' ? 396 : 180} step={units === 'imperial' ? 1 : 0.5} value={units === 'imperial' ? Math.round(kgToLb(store.weightKg)) : store.weightKg} onChange={(e) => patch({ weightKg: units === 'imperial' ? roundTo(lbToKg(Number(e.target.value)), 3) : Number(e.target.value) })} />
             <div className="mt-2 flex items-center justify-between">
-              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Decrease weight" onClick={() => patch({ weightKg: Math.max(35, Math.round((store.weightKg - 0.5) * 10) / 10) })}>−</button>
-              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Increase weight" onClick={() => patch({ weightKg: Math.min(180, Math.round((store.weightKg + 0.5) * 10) / 10) })}>+</button>
+              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Decrease weight" onClick={() => patch({ weightKg: nudgeWeightKg(store.weightKg, units, -1) })}>−</button>
+              <button type="button" className="grid h-9 w-9 place-items-center rounded-full bg-slate-100" aria-label="Increase weight" onClick={() => patch({ weightKg: nudgeWeightKg(store.weightKg, units, 1) })}>+</button>
             </div>
             {(() => {
               const bmi = bmiOf(store.weightKg, store.heightCm);
@@ -2996,13 +2987,13 @@ export default function Home() {
                   <div className="relative mt-2 h-2 rounded-full bg-gradient-to-r from-[#0ea5e9] via-[#22c55e] to-[#f59e0b]">
                     <span className="absolute top-1/2 h-4 w-4 -translate-y-1/2 rounded-full border-2 border-white" style={{ left: `${marker}%`, background: band.color }} />
                   </div>
-                  <p className="mt-3 text-xs text-muted">Daily target preview · {maintainKcal(store.weightKg, store.heightCm, ageOf(store.birthday), store.gender)} kcal · {waterTargetL(store.weightKg).toFixed(1)} L water</p>
+                  <p className="mt-3 text-xs text-muted">Daily target preview · {maintainKcal(store.weightKg, store.heightCm, ageOf(store.birthday), store.gender)} kcal · {formatWater(waterTargetL(store.weightKg), units)} water</p>
                 </div>
               );
             })()}
           </div>
           <button type="button" className={`${primaryClass} mt-4 w-full`} onClick={finishProfile}>
-            {store.profileComplete ? 'Save' : 'Save & continue'}
+            {store.profileComplete ? t('save') : t('saveContinue')}
           </button>
         </section>
       )}
@@ -3063,20 +3054,20 @@ export default function Home() {
             <section className="lux-stage tab-scroll">
               <div className="obsidian-hero px-5 py-7">
                 <div className="relative grid place-items-center">
-                  <ActivityRings calories={eaten.calories} steps={store.steps} water={store.waterL} draw={drawRings} night />
+                  <ActivityRings calories={eaten.calories} steps={store.steps} water={store.waterL} waterGoal={waterGoalL(units)} draw={drawRings} night />
                   <div className="pointer-events-none absolute w-[62px] text-center">
                     <div className="text-[26px] leading-none font-black tabular-nums tracking-[-0.05em]">{kcalLeft}</div>
-                    <div className="mt-1 text-[8px] leading-tight font-bold tracking-[0.12em] text-muted uppercase">{eaten.calories >= CAL_GOAL ? 'Goal met' : 'kcal left'}</div>
+                    <div className="mt-1 text-[8px] leading-tight font-bold tracking-[0.12em] text-muted uppercase">{eaten.calories >= CAL_GOAL ? t('goalMet') : t('kcalLeft')}</div>
                   </div>
                 </div>
                 <p className="sr-only">
-                  Calories {eaten.calories} of {CAL_GOAL}. Steps {store.steps} of {STEP_GOAL}. Water {store.waterL} liters of {WATER_GOAL}.
+                  Calories {eaten.calories} of {CAL_GOAL}. Steps {store.steps} of {STEP_GOAL}. Water {formatWater(store.waterL, units)} of {formatWaterGoal(units)}.
                 </p>
                 <div className="mt-2 grid grid-cols-3 gap-2 text-center">
                   {[
                     { label: t('calories'), color: '#ff2d55', value: eaten.calories.toLocaleString(), goal: CAL_GOAL.toLocaleString() },
                     { label: t('steps'), color: '#22c55e', value: store.steps.toLocaleString(), goal: STEP_GOAL.toLocaleString() },
-                    { label: t('water'), color: '#0ea5e9', value: `${store.waterL.toFixed(2)} L`, goal: '3.00 L' },
+                    { label: t('water'), color: '#0ea5e9', value: formatWater(store.waterL, units), goal: formatWaterGoal(units) },
                   ].map((item) => (
                     <div key={item.label}>
                       <div className="text-[11px] font-extrabold" style={{ color: item.color }}>{item.label}</div>
@@ -3090,10 +3081,10 @@ export default function Home() {
               <div className="mt-4 flex gap-2">
                 <div className="glass relative flex h-14 min-w-0 flex-1 items-center overflow-hidden rounded-full">
                   {waterPulse > 0 && <span key={waterPulse} className="action-fill absolute inset-0 bg-[#64d2ff]/30" />}
-                  <button type="button" className="relative h-full flex-1 text-sm font-extrabold" onClick={removeWater}>-250 ml</button>
+                  <button type="button" className="relative h-full flex-1 text-sm font-extrabold" onClick={removeWater}>-{waterStepLabel(units)}</button>
                   <button type="button" className="relative flex h-full flex-1 items-center justify-center gap-1 text-sm font-extrabold" onClick={addWater}>
                     <Icon name="water" className="h-4 w-4 text-[#0ea5e9]" />
-                    +250 ml
+                    +{waterStepLabel(units)}
                   </button>
                   <button type="button" className="relative grid h-10 w-10 shrink-0 place-items-center rounded-full text-sm font-black text-muted" aria-label="Reset water" onClick={resetWater}>↺</button>
                 </div>
@@ -3283,31 +3274,31 @@ export default function Home() {
           {activeTab === 'ai' && (
             <section className="tab-scroll">
               {(() => {
-                if (aiTab === 'coach') {
-                  return <div className="mb-3 rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]">AI Coach · Free</div>;
-                }
-                const kind: QuotaKind = aiTab === 'kitchen' ? 'kitchen' : 'scan';
+                const kind: QuotaKind = aiTab === 'coach' ? 'coach' : aiTab === 'kitchen' ? 'kitchen' : 'scan';
                 const usage = quotaLeft(kind, pro);
-                const word = kind === 'scan' ? 'scans' : 'recipes';
+                const copy: CopyKey = kind === 'coach' ? 'coachLeft' : kind === 'kitchen' ? 'recipesLeft' : 'scansLeft';
                 return isPro ? (
-                  <div className="mb-3 rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" key={quotaTick}>Unlimited</div>
+                  <div className="mb-3 rounded-full bg-white px-4 py-2 text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" key={quotaTick}>{t('proActive')} · {t('unlimited')}</div>
                 ) : (
-                  <button type="button" key={quotaTick} className="mb-3 flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" onClick={openPro}>
-                    <span>{usage.left}/{usage.limit} free {word} left today</span>
+                  <button type="button" key={quotaTick} className="mb-3 flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-start text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" onClick={() => { setPaywallReason(null); setShowPaywall(true); }}>
+                    <span className="flex items-center gap-2">
+                      <span className={`h-2 w-2 rounded-full ${usage.left === 0 ? 'bg-[#f43f5e]' : 'bg-[#22c55e]'}`} aria-hidden="true" />
+                      {t(copy, { n: usage.left, max: usage.limit })}
+                    </span>
+                    <span className="rtl-flip text-muted" aria-hidden="true">›</span>
                   </button>
                 );
               })()}
-              {fairUseNote && <p className="mb-3 px-1 text-xs font-semibold text-slate-700">{fairUseNote}</p>}
               {challenge && (
                 <div className="mb-3">
                   <button type="button" className="flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" aria-expanded={challengeOpen} onClick={() => setChallengeOpen((open) => !open)}>
-                    <span className="truncate">Today's AI Challenge{challenge.completed ? ' · Done' : ''}</span>
-                    <span className="shrink-0 text-muted">{challengeOpen ? 'Hide' : 'Show'}</span>
+                    <span className="truncate">{t('challengeTitle')}{challenge.completed ? ` · ${t('completed')}` : ''}</span>
+                    <span className="shrink-0 text-muted">{challengeOpen ? t('hide') : t('show')}</span>
                   </button>
                 {challengeOpen && (
                 <article className="obsidian-hero on-gradient mt-2 px-4 py-3.5">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="rounded-full px-2.5 py-1 text-[10px] font-extrabold tracking-[0.08em]" style={{ background: 'rgba(255,255,255,0.1)' }}>Today's AI Challenge</span>
+                    <span className="rounded-full px-2.5 py-1 text-[10px] font-extrabold tracking-[0.08em]" style={{ background: 'rgba(255,255,255,0.1)' }}>{t('challengeTitle')}</span>
                     <span className="shrink-0 text-[10px] font-extrabold tracking-wide text-[#c4b5fd]">{store.streak} day streak</span>
                   </div>
                   <h3 className="mt-2.5 text-[15px] leading-tight font-black tracking-[-0.03em]">{challenge.title}</h3>
@@ -3356,7 +3347,7 @@ export default function Home() {
                 ))}
               </div>
               <div className="chip-row mb-3">
-                <button type="button" className="shrink-0 rounded-full bg-white px-3 py-1.5 text-[11px] font-extrabold shadow-sm" onClick={() => { const next = LANGS[(LANGS.indexOf(lang) + 1) % LANGS.length]; setLang(next); writeLang(next); }}>{lang.toUpperCase()}</button>
+                <button type="button" className="shrink-0 rounded-full bg-white px-3 py-1.5 text-[11px] font-extrabold shadow-sm" onClick={() => chooseLang(LANGS[(LANGS.indexOf(lang) + 1) % LANGS.length])}>{lang.toUpperCase()}</button>
                 {DIET_FLAGS.map((flag) => (
                   <button key={flag} type="button" className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-extrabold ${diet[flag] ? 'bg-[#dcfce7] text-[#047857]' : 'bg-white text-slate-600 shadow-sm'}`} onClick={() => setDiet((current) => { const next = { ...current, [flag]: !current[flag] }; writeDiet(next); return next; })}>
                     {t(flag)}
@@ -3365,7 +3356,7 @@ export default function Home() {
               </div>
               {aiTab === 'kitchen' && (
                 <div className="card p-5">
-                  <h3 className="font-black tracking-[-0.03em]">Fridge</h3>
+                  <h3 className="font-black tracking-[-0.03em]">{t('fridge')}</h3>
                   <p className="mt-1 text-xs text-muted">Live recipes from the fridge.</p>
                   <div className="chip-row mt-3">
                     {CRAVINGS.map((item) => (
@@ -3375,8 +3366,8 @@ export default function Home() {
                     ))}
                   </div>
                   <div className="mt-3 flex gap-2">
-                    <input className={fieldClass} value={ingredient} placeholder="What's in your fridge?" onChange={(e) => setIngredient(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addIngredient(); }} />
-                    <button type="button" className={primaryClass} onClick={addIngredient}>Add</button>
+                    <input className={fieldClass} value={ingredient} placeholder={t('fridgePlaceholder')} onChange={(e) => setIngredient(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addIngredient(); }} />
+                    <button type="button" className={primaryClass} onClick={addIngredient}>{t('add')}</button>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
                     {store.fridge.map((item) => (
@@ -3386,9 +3377,9 @@ export default function Home() {
                     ))}
                   </div>
                   <button type="button" className={`${primaryClass} mt-4 w-full`} disabled={recipeBusy} onClick={() => generateRecipe()}>
-                    {recipeBusy ? 'Generating...' : 'Generate recipe'}
+                    {recipeBusy ? t('generating') : t('generateRecipe')}
                   </button>
-                  {recipeBusy && !recipe && <p className="mt-3 text-sm font-semibold">Generating...</p>}
+                  {recipeBusy && !recipe && <p className="mt-3 text-sm font-semibold">{t('generating')}</p>}
                   {recipe && (
                     <div className="glass-quiet mt-3 rounded-3xl p-4">
                       <div className="flex items-center gap-2">
@@ -3459,10 +3450,10 @@ export default function Home() {
                     <div className="pointer-events-none absolute inset-4 rounded-[22px] border border-white/80 shadow-[0_0_0_1px_rgba(16,185,129,0.35)]" />
                   </div>
                   <div className="mt-3 flex gap-2">
-                    <button type="button" className={`${primaryClass} min-w-0 flex-1`} disabled={scanBusy} onClick={() => { setScanMode('photo'); cameraInputRef.current?.click(); }}><Glyph name="camera" />{scanBusy ? 'Analyzing...' : 'Take Food Photo'}</button>
-                    <button type="button" className={quietClass} disabled={scanBusy} onClick={() => { setScanMode('photo'); galleryInputRef.current?.click(); }}><Glyph name="image" />Gallery</button>
+                    <button type="button" className={`${primaryClass} min-w-0 flex-1`} disabled={scanBusy} onClick={() => { setScanMode('photo'); cameraInputRef.current?.click(); }}><Glyph name="camera" />{scanBusy ? t('analyzing') : t('takePhoto')}</button>
+                    <button type="button" className={quietClass} disabled={scanBusy} onClick={() => { setScanMode('photo'); galleryInputRef.current?.click(); }}><Glyph name="image" />{t('gallery')}</button>
                   </div>
-                  <button type="button" className={`mt-2 h-9 rounded-full px-4 text-xs font-extrabold ${scanMode === 'barcode' ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-700'}`} onClick={() => { setScanMode('barcode'); setBarcodeOpen(true); }}>Barcode</button>
+                  <button type="button" className={`mt-2 h-9 rounded-full px-4 text-xs font-extrabold ${scanMode === 'barcode' ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-700'}`} onClick={() => { setScanMode('barcode'); setBarcodeOpen(true); }}>{t('barcodeShort')}</button>
                   <input ref={cameraInputRef} className="hidden" type="file" accept="image/*" capture="environment" onChange={(event) => { onPickScanPhoto(event.target.files?.[0], scanMode === 'barcode'); event.target.value = ''; }} />
                   <input ref={galleryInputRef} className="hidden" type="file" accept="image/*" onChange={(event) => { onPickScanPhoto(event.target.files?.[0], scanMode === 'barcode'); event.target.value = ''; }} />
                   {scanMode === 'barcode' && (
@@ -3589,15 +3580,15 @@ export default function Home() {
                 <div className="card p-5">
                   <div className="mb-4 flex items-start justify-between gap-3">
                     <div>
-                      <h3 className="font-black tracking-[-0.03em]">AI Coach</h3>
+                      <h3 className="font-black tracking-[-0.03em]">{t('coach')}</h3>
                       <p className="text-xs text-muted">Live coach</p>
                     </div>
-                    <button type="button" aria-label="Clear Chat" className="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-semibold text-muted" onClick={clearChat}>
+                    <button type="button" aria-label={t('clearChat')} className="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-semibold text-muted" onClick={clearChat}>
                       <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
                         <path d="M4 12a8 8 0 1 0 2.3-5.6" strokeLinecap="round" />
                         <path d="M4 4v4h4" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
-                      Clear Chat
+                      {t('clearChat')}
                     </button>
                   </div>
                   <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
@@ -3607,11 +3598,11 @@ export default function Home() {
                       </button>
                     ))}
                   </div>
-                  <div ref={chatRef} className="mb-3 max-h-80 space-y-2 overflow-y-auto pr-1">
+                  <div ref={chatRef} className="mb-3 max-h-80 space-y-2 overflow-y-auto pe-1">
                     {store.chat.map((message) => (
-                      <div key={message.id} className={message.sender === 'user' ? 'text-right' : 'text-left'}>
-                        <span className={`inline-block max-w-[90%] rounded-3xl px-3.5 py-2.5 text-left text-sm leading-relaxed ${message.sender === 'user' ? 'btn-primary on-gradient' : 'glass-quiet text-slate-700'}`}>
-                          {message.text}
+                      <div key={message.id} className={message.sender === 'user' ? 'text-end' : 'text-start'}>
+                        <span className={`inline-block max-w-[90%] rounded-3xl px-3.5 py-2.5 text-start text-sm leading-relaxed ${message.sender === 'user' ? 'btn-primary on-gradient' : 'glass-quiet text-slate-700'}`}>
+                          {message.text === 'Generating...' ? t('generating') : message.text}
                         </span>
                         {message.sender === 'ai' && message.text !== 'Generating...' && (
                           <button type="button" className="mt-1 block text-[10px] font-semibold text-muted underline" onClick={() => reportAi('coach', message.text)}>Report</button>
@@ -3620,14 +3611,14 @@ export default function Home() {
                     ))}
                   </div>
                   <form className="flex gap-2" onSubmit={(e: FormEvent) => { e.preventDefault(); sendChat(); }}>
-                    <input className={fieldClass} value={chatInput} placeholder="Ask about macros or weight loss" disabled={coachBusy} onChange={(e) => setChatInput(e.target.value)} />
+                    <input className={fieldClass} value={chatInput} placeholder={t('coachPlaceholder')} disabled={coachBusy} onChange={(e) => setChatInput(e.target.value)} />
                     <MicButton hot={voiceFor === 'coach'} phase={voicePhase} label="Dictate a question" disabled={coachBusy || (voiceFor !== null && voiceFor !== 'coach')} onClick={() => dictate('coach', setChatInput)} />
                     <button type="submit" className={primaryClass} disabled={coachBusy}>{coachBusy ? '…' : 'Send'}</button>
                   </form>
                   {voiceFor === 'coach' && voiceNote && <p className="mt-2 text-sm font-semibold text-slate-700">{voiceNote}</p>}
                 </div>
               )}
-              <p className="mt-4 px-1 text-[11px] leading-relaxed text-muted">{t('disclaimer')}</p>
+              <p className="mt-4 px-1 text-center text-[11px] leading-snug text-muted">{t('scanCaption')}</p>
             </section>
           )}
 
@@ -3671,7 +3662,7 @@ export default function Home() {
 
               <div className="card mt-4 p-5">
                 <h3 className="text-lg font-black tracking-[-0.03em]">Pre & post workout</h3>
-                <p className="mt-1 text-xs leading-relaxed text-muted">Meals for the next 1–2 hours before you train, and the plate after, scaled to {store.weightKg.toFixed(0)} kg.</p>
+                <p className="mt-1 text-xs leading-relaxed text-muted">Meals for the next 1–2 hours before you train, and the plate after, scaled to {formatWeight(store.weightKg, units, 0)}.</p>
                 <div className="mt-3 grid grid-cols-2 gap-2">
                   {([
                     ['muscle', 'Muscle gain'],
@@ -3689,7 +3680,7 @@ export default function Home() {
                     </button>
                   ))}
                 </div>
-                {fuelBusy && <p className="mt-3 text-sm font-semibold text-slate-700">Building your plates...</p>}
+                {fuelBusy && <p className="mt-3 text-sm font-semibold text-slate-700">{t('buildingPlates')}</p>}
                 <div className={`mt-4 rounded-2xl bg-slate-50 p-3 transition-opacity ${fuelBusy ? 'opacity-60' : ''}`}>
                   <div className="text-[11px] font-bold tracking-[0.14em] text-[#ff375f]">1–2 HOURS BEFORE</div>
                   <div className="mt-1 font-extrabold">{prePlate.title}</div>
@@ -3705,12 +3696,12 @@ export default function Home() {
                   <p className="mt-2 text-xs leading-relaxed text-muted">{postPlate.why}</p>
                 </div>
                 <button type="button" className={`${quietClass} mt-3 w-full`} disabled={fuelBusy} onClick={() => { if (blockForQuota('kitchen')) return; setPlateCursor((n) => n + 1); }}>
-                  {fuelBusy ? 'Building your plates...' : 'Regenerate Meal Plan'}
+                  {fuelBusy ? t('buildingPlates') : t('regenPlan')}
                 </button>
               </div>
 
               <div className="card mt-4 p-5">
-                <h3 className="text-lg font-black tracking-[-0.03em]">Strength · 1RM</h3>
+                <h3 className="text-lg font-black tracking-[-0.03em]">{t('strength')}</h3>
                 <p className="mt-1 text-xs text-muted">Epley estimate from the weight you lifted and the reps you completed.</p>
                 <div className="mt-3 grid grid-cols-3 gap-2">
                   {LIFTS.map((name) => (
@@ -3721,24 +3712,24 @@ export default function Home() {
                 </div>
                 <div className="mt-3 grid grid-cols-2 gap-2">
                   <label className="text-xs font-semibold text-muted">
-                    Weight (kg)
+                    {t('weight')} ({weightUnit(units)})
                     <input className={`${fieldClass} mt-1`} inputMode="decimal" value={liftWeight} onChange={(e) => setLiftWeight(e.target.value)} />
                   </label>
                   <label className="text-xs font-semibold text-muted">
-                    Reps
+                    {t('reps')}
                     <input className={`${fieldClass} mt-1`} inputMode="numeric" value={liftReps} onChange={(e) => setLiftReps(e.target.value)} />
                   </label>
                 </div>
                 <div className="mt-3 flex items-center gap-2">
-                  <span className="text-3xl font-black tabular-nums tracking-[-0.04em]">{previewRm ?? '—'} kg</span>
+                  <span className="text-3xl font-black tabular-nums tracking-[-0.04em]" dir="ltr">{previewRm !== null ? formatLiftWeight(previewRm, units) : '—'}</span>
                   <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-extrabold tracking-[0.14em] text-muted">1RM</span>
                 </div>
-                <button type="button" className={`${primaryClass} mt-3 w-full`} onClick={saveLift}>Save set</button>
+                <button type="button" className={`${primaryClass} mt-3 w-full`} onClick={saveLift}>{t('saveSet')}</button>
                 <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                   {bestLifts.map((item) => (
                     <div key={item.name} className="rounded-2xl bg-slate-50 px-1 py-2">
                       <div className="text-[10px] font-bold text-muted">{item.name === 'Bench Press' ? 'Bench' : item.name}</div>
-                      <div className="mt-1 text-sm font-black tabular-nums">{item.best ? `${item.best}` : '—'}</div>
+                      <div className="mt-1 text-sm font-black tabular-nums">{item.best ? formatLiftWeight(item.best, units) : '—'}</div>
                     </div>
                   ))}
                 </div>
@@ -3828,51 +3819,60 @@ export default function Home() {
                     {emailOk(store.userEmail) && <span className="rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#15803d]">Verified</span>}
                   </p>
                   <p className="mt-1 text-xs text-muted">
-                    {store.gender} · {Math.round(store.heightCm)} cm · {store.weightKg.toFixed(1)} kg · BMI {bmiOf(store.weightKg, store.heightCm).toFixed(1)}
+                    {store.gender} · {formatHeightUnits(store.heightCm, units)} · {formatWeight(store.weightKg, units)} · BMI {bmiOf(store.weightKg, store.heightCm).toFixed(1)}
                   </p>
                   {store.session && emailOk(store.userEmail) && <p className="mt-1 text-xs text-muted">{PROVIDERS[store.session.provider].label}{store.paymentLabel ? ` · ${store.paymentLabel}` : ''}</p>}
                 </div>
-                <button type="button" className={quietClass} onClick={() => patch({ flowStep: 'profile' })}>Edit</button>
+                <button type="button" className={quietClass} onClick={() => patch({ flowStep: 'profile' })}>{t('edit')}</button>
               </div>
               <div className="card-quiet mb-3 p-3">
                 <p className="text-[11px] font-bold tracking-[0.14em] text-muted">{t('language')}</p>
                 <div className="chip-row mt-2">
                   {LANGS.map((code) => (
-                    <button key={code} type="button" className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-extrabold ${lang === code ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-600'}`} onClick={() => { setLang(code); writeLang(code); }}>{languageName(code)}</button>
+                    <button key={code} type="button" className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-extrabold ${lang === code ? 'btn-primary on-gradient' : 'bg-slate-100 text-slate-600'}`} aria-pressed={lang === code} onClick={() => chooseLang(code)}>{languageName(code)}</button>
                   ))}
                 </div>
+                <p className="mt-3 text-[11px] font-bold tracking-[0.14em] text-muted">{t('settingsUnits')}</p>
+                <div className="mt-2 grid grid-cols-2 gap-1.5 rounded-full bg-slate-100 p-1" role="group" aria-label={t('settingsUnits')}>
+                  {(['metric', 'imperial'] as const).map((system) => (
+                    <button key={system} type="button" aria-pressed={units === system} className={`h-9 rounded-full text-[12px] font-extrabold ${units === system ? 'btn-primary on-gradient' : 'text-slate-600'}`} onClick={() => chooseUnits(system)}>
+                      {system === 'metric' ? t('unitMetric') : t('unitImperial')}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1.5 px-1 text-[10px] font-semibold text-muted">{t('unitsHint')}</p>
               </div>
               <button type="button" className="mb-3 flex w-full items-center justify-between rounded-full bg-white px-4 py-2 text-left text-xs font-extrabold shadow-[0_8px_20px_rgba(15,23,42,0.05)]" onClick={openSubscription}>
-                <span>{pro ? 'FitBite Pro · Active' : 'FitBite Pro'}</span>
-                <span className="text-muted">Plans</span>
+                <span>{pro ? t('proActive') : t('proBanner')}</span>
+                <span className="text-muted">{t('plans')}</span>
               </button>
               <div className="card mb-4 overflow-hidden">
                 {([
-                  ['account', 'Account & Cloud Sync', 'cloud'],
-                  ['body', 'Body Profile', 'user'],
-                  ['alerts', 'Wrist Notifications & Alerts', 'bell'],
-                  ['sensor', 'Background Sensors', 'activity'],
-                  ['privacy', 'Privacy & Data', 'shield'],
-                  ['feedback', 'VIP Support', 'message'],
-                  ['update', 'App Update & System Diagnostics', 'download'],
-                  ['about', 'About FitBite Pro', 'info'],
+                  ['account', t('menuAccount'), 'cloud'],
+                  ['body', t('menuBody'), 'user'],
+                  ['alerts', t('menuAlerts'), 'bell'],
+                  ['sensor', t('menuSensors'), 'activity'],
+                  ['privacy', t('menuPrivacy'), 'shield'],
+                  ['feedback', t('menuSupport'), 'message'],
+                  ['update', t('menuUpdate'), 'download'],
+                  ['about', t('menuAbout'), 'info'],
                 ] as const).map(([id, label, icon]) => (
                   <button key={id} type="button" className="flex w-full items-center gap-3 px-4 py-3 text-left" onClick={() => setDesk(id)}>
                     <span className="on-gradient grid h-9 w-9 shrink-0 place-items-center rounded-2xl bg-[#0F1115]">
                       <DeskIcon name={icon} />
                     </span>
                     <span className="min-w-0 flex-1 text-sm font-extrabold tracking-[-0.02em]">{label}</span>
-                    <span className="text-muted">›</span>
+                    <span className="rtl-flip text-muted" aria-hidden="true">›</span>
                   </button>
                 ))}
               </div>
 
               <div className="mb-2 flex items-end justify-between">
-                <h2 className="text-lg font-black tracking-[-0.03em]">Watch Hub</h2>
-                <span className="text-xs text-muted">Live pulse</span>
+                <h2 className="text-lg font-black tracking-[-0.03em]">{t('watchHub')}</h2>
+                <span className="text-xs text-muted">{t('livePulse')}</span>
               </div>
               <button type="button" className={`${primaryClass} mb-3 w-full`} onClick={() => void scanAnyWatch()}>
-                Scan & Pair Any Bluetooth Watch
+                {t('scanPair')}
               </button>
               {[
                 ...WATCHES.map((watch) => ({ id: watch.id, name: watch.name, model: watch.model, battery: store.batteries[watch.id], custom: false as const })),
@@ -3975,16 +3975,22 @@ export default function Home() {
               )}
 
               <div className="card-quiet mb-4 space-y-2 p-5 text-sm">
-                <a className="block font-extrabold underline" href={APP_LEGAL_URLS.privacy} {...legalTarget(APP_LEGAL_URLS.privacy)}>Privacy Policy</a>
-                <a className="block font-extrabold underline" href={APP_LEGAL_URLS.terms} {...legalTarget(APP_LEGAL_URLS.terms)}>Terms of Use</a>
+                <button type="button" className="flex w-full items-center justify-between py-1 text-start font-extrabold" onClick={() => setLegal('privacy')}>
+                  <span>{t('privacyPolicy')}</span>
+                  <span className="rtl-flip text-muted" aria-hidden="true">›</span>
+                </button>
+                <button type="button" className="flex w-full items-center justify-between py-1 text-start font-extrabold" onClick={() => setLegal('terms')}>
+                  <span>{t('termsOfUse')}</span>
+                  <span className="rtl-flip text-muted" aria-hidden="true">›</span>
+                </button>
               </div>
               <div className="card mb-4 p-5">
-                <h3 className="text-sm font-black">Delete Account & Erase All Local Data</h3>
-                <p className="mt-2 text-xs leading-relaxed text-muted">This removes the session, meals, workouts, messages, and settings stored on this phone.</p>
-                <button type="button" className="mt-3 h-11 w-full rounded-full bg-[#ffe4e6] text-sm font-extrabold text-[#be123c]" onClick={() => setShowDeleteConfirm(true)}>Delete Account & Erase All Local Data</button>
+                <h3 className="text-sm font-black">{t('deleteAccount')}</h3>
+                <p className="mt-2 text-xs leading-relaxed text-muted">{t('deleteBody')}</p>
+                <button type="button" className="mt-3 h-11 w-full rounded-full bg-[#ffe4e6] text-sm font-extrabold text-[#be123c]" onClick={() => setShowDeleteConfirm(true)}>{t('deleteAccount')}</button>
               </div>
               <button type="button" className={`${quietClass} w-full`} onClick={() => { patch({ session: null, authProvider: null, flowStep: 'welcome' }); setActiveTab('today'); showToast('Signed out'); }}>
-                Sign out
+                {t('signOut')}
               </button>
             </section>
           )}
@@ -3994,7 +4000,7 @@ export default function Home() {
               <div className="card max-h-[88dvh] w-full max-w-[390px] overflow-y-auto p-5" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
                 <div className="flex items-start justify-between gap-3">
                   <h2 className="text-xl font-black tracking-[-0.03em]">
-                    {desk === 'account' ? 'Cloud sync' : desk === 'body' ? 'Body profile' : desk === 'alerts' ? 'Notifications' : desk === 'sensor' ? 'Sensor guard' : desk === 'privacy' ? t('privacy') : desk === 'feedback' ? 'Concierge' : desk === 'update' ? 'Diagnostics' : 'About FitBite Pro'}
+                    {desk === 'account' ? t('menuAccount') : desk === 'body' ? t('menuBody') : desk === 'alerts' ? t('menuAlerts') : desk === 'sensor' ? t('menuSensors') : desk === 'privacy' ? t('privacy') : desk === 'feedback' ? t('menuSupport') : desk === 'update' ? t('menuUpdate') : t('menuAbout')}
                   </h2>
                   <button type="button" className="grid h-9 w-9 place-items-center rounded-full text-lg text-slate-400" aria-label="Close" onClick={() => setDesk(null)}>✕</button>
                 </div>
@@ -4017,8 +4023,8 @@ export default function Home() {
                       ))}
                     </div>
                     <p className="font-extrabold">BMI {bmiOf(store.weightKg, store.heightCm).toFixed(1)} · {ageOf(store.birthday)} years</p>
-                    <p className="text-muted">{Math.round(store.heightCm)} cm · {store.weightKg.toFixed(1)} kg · {store.userEmail}</p>
-                    <p className="text-muted">Daily targets · {CAL_GOAL} kcal · 150g protein · 220g carbs · 75g fat · {WATER_GOAL.toFixed(1)} L water</p>
+                    <p className="text-muted">{formatHeightUnits(store.heightCm, units)} · {formatWeight(store.weightKg, units)} · {store.userEmail}</p>
+                    <p className="text-muted">Daily targets · {CAL_GOAL} kcal · 150 g protein · 220 g carbs · 75 g fat · {formatWaterGoal(units)} water</p>
                     <button type="button" className={`${primaryClass} w-full`} onClick={() => { setDesk(null); patch({ flowStep: 'profile' }); }}>Edit profile</button>
                   </div>
                 )}
@@ -4086,9 +4092,9 @@ export default function Home() {
                       }}>{label}</button>
                     ))}
                     {!prefs.appLock && <input className={fieldClass} inputMode="numeric" maxLength={4} placeholder="4-digit PIN" value={pinDraft} onChange={(event) => setPinDraft(event.target.value.replace(/\D/g, '').slice(0, 4))} />}
-                    <a className="block py-2 text-sm font-extrabold text-[#0f172a] underline" href={APP_LEGAL_URLS.privacy} {...legalTarget(APP_LEGAL_URLS.privacy)}>Privacy Policy</a>
-                    <a className="block py-2 text-sm font-extrabold text-[#0f172a] underline" href={APP_LEGAL_URLS.terms} {...legalTarget(APP_LEGAL_URLS.terms)}>Terms of Use</a>
-                    <button type="button" className="h-11 w-full rounded-full bg-[#ffe4e6] text-sm font-extrabold text-[#be123c]" onClick={() => setShowDeleteConfirm(true)}>Delete Account & Erase All Local Data</button>
+                    <button type="button" className="block w-full py-2 text-start text-sm font-extrabold text-[#0f172a] underline" onClick={() => setLegal('privacy')}>{t('privacyPolicy')}</button>
+                    <button type="button" className="block w-full py-2 text-start text-sm font-extrabold text-[#0f172a] underline" onClick={() => setLegal('terms')}>{t('termsOfUse')}</button>
+                    <button type="button" className="h-11 w-full rounded-full bg-[#ffe4e6] text-sm font-extrabold text-[#be123c]" onClick={() => setShowDeleteConfirm(true)}>{t('deleteAccount')}</button>
                   </div>
                 )}
                 {desk === 'feedback' && (
@@ -4125,107 +4131,37 @@ export default function Home() {
           {showDeleteConfirm && (
             <div className="fixed inset-0 z-[60] grid place-items-end bg-black/55 px-3 pb-6 backdrop-blur-md sm:place-items-center" onClick={() => setShowDeleteConfirm(false)}>
               <div className="card w-full max-w-[390px] p-5" role="dialog" aria-modal="true" aria-labelledby="delete-title" onClick={(event) => event.stopPropagation()}>
-                <h2 id="delete-title" className="text-xl font-black tracking-[-0.03em]">Delete account?</h2>
-                <p className="mt-2 text-sm leading-relaxed text-muted">This erases the profile, meals, workouts, chat, and settings stored on this phone. It cannot be undone.</p>
+                <h2 id="delete-title" className="text-xl font-black tracking-[-0.03em]">{t('deleteTitle')}</h2>
+                <p className="mt-2 text-sm leading-relaxed text-muted">{t('deleteBody')}</p>
                 <div className="mt-4 flex gap-2">
-                  <button type="button" className={`${quietClass} flex-1`} onClick={() => setShowDeleteConfirm(false)}>Cancel</button>
-                  <button type="button" className="h-11 flex-1 rounded-full bg-[#ffe4e6] text-sm font-extrabold text-[#be123c]" onClick={() => eraseLocalAccount()}>Delete everything</button>
+                  <button type="button" className={`${quietClass} flex-1`} onClick={() => setShowDeleteConfirm(false)}>{t('cancel')}</button>
+                  <button type="button" className="h-11 flex-1 rounded-full bg-[#ffe4e6] text-sm font-extrabold text-[#be123c]" onClick={() => eraseLocalAccount()}>{t('deleteConfirm')}</button>
                 </div>
               </div>
             </div>
           )}
 
           {showPaywall && (
-            <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/55 px-3 pb-6 backdrop-blur-md sm:items-center" onClick={() => setShowPaywall(false)}>
-              <div className="on-gradient relative z-[81] w-full max-w-[390px] rounded-[28px] border border-white/10 p-5" role="dialog" aria-modal="true" aria-labelledby="pay-title" style={{ overflowY: 'auto', maxHeight: '88dvh', background: 'linear-gradient(168deg, #171b24 0%, #0e1117 62%)', color: '#f4f6f8', boxShadow: '0 24px 50px rgba(8, 10, 16, 0.28)' }} onClick={(event) => event.stopPropagation()}>
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="text-[10px] font-extrabold tracking-[0.16em] text-[#c4b5fd]">FITBITE PRO</p>
-                    <h2 id="pay-title" className="mt-1 text-[1.65rem] font-black leading-tight tracking-[-0.04em]">{isPro ? 'Your plan' : 'Choose a plan'}</h2>
-                    {isPro && <p className="mt-1 text-xs font-extrabold text-[#86efac]">FitBite Pro is active</p>}
-                  </div>
-                  <button type="button" className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-lg" style={{ background: 'rgba(255,255,255,0.1)', color: '#fff' }} aria-label="Close FitBite Pro" onClick={() => setShowPaywall(false)}>✕</button>
-                </div>
-                <div className="mt-4 flex flex-col gap-3">
-                  <button type="button" aria-pressed={proPlan === 'monthly'} className="flex min-h-[76px] w-full items-center justify-between gap-3 rounded-2xl px-4 py-3 text-left" style={{ background: proPlan === 'monthly' ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === 'monthly' ? 'inset 0 0 0 2px #fff' : 'inset 0 0 0 1px rgba(255,255,255,0.16)', color: '#fff' }} onClick={() => setProPlan('monthly')}>
-                    <span className="text-sm font-extrabold">Monthly Plan {isPro && readUserSubscription().plan === 'monthly' ? '· Active' : ''}</span>
-                    <span className="text-base font-black">$4.99/mo</span>
-                  </button>
-                  <button type="button" aria-pressed={proPlan === 'yearly'} className="flex min-h-[92px] w-full flex-col items-start justify-center gap-2 rounded-2xl px-4 py-3 text-left" style={{ background: proPlan === 'yearly' ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)', boxShadow: proPlan === 'yearly' ? 'inset 0 0 0 2px #fff' : 'inset 0 0 0 1px rgba(255,255,255,0.16)', color: '#fff' }} onClick={() => setProPlan('yearly')}>
-                    <span className="flex w-full items-center justify-between gap-3">
-                      <span className="text-sm font-extrabold">Yearly Plan {isPro && readUserSubscription().plan === 'yearly' ? '· Active' : ''}</span>
-                      <span className="text-base font-black">$29.99/yr</span>
-                    </span>
-                    <span className="inline-flex rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-extrabold text-[#047857]">Best Value · Save 50%</span>
-                  </button>
-                </div>
-                <button
-                  type="button"
-                  className="relative z-[2] mt-4 h-12 w-full rounded-full bg-white text-sm font-extrabold"
-                  style={{ color: '#0f1115', pointerEvents: 'auto' }}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    if (isPro && readUserSubscription().plan === proPlan) {
-                      showToast('FitBite Pro is active');
-                      setShowPaywall(false);
-                      return;
-                    }
-                    void subscribeFitBitePro(proPlan).then((result) => {
-                      if (!result.ok || !result.active) {
-                        showToast('Google Play could not start the purchase');
-                        return;
-                      }
-                      writeUserSubscription({ isPro: true, plan: proPlan });
-                      patch({ proActive: true });
-                      showToast('Welcome to FitBite Pro! 🎉');
-                      setShowPaywall(false);
-                    });
-                  }}
-                >
-                  {isPro ? (readUserSubscription().plan === proPlan ? 'Current plan' : 'Switch plan') : 'Subscribe Now'}
-                </button>
-                <ul className="mt-4 space-y-2 text-sm leading-snug">
-                  {[
-                    'Basic AI Coach is Free',
-                    'Pro unlocks Unlimited AI Food Scans',
-                    'Full AI Kitchen & Smart Swaps',
-                    'Body Progress Vision',
-                  ].map((line) => (
-                    <li key={line} className="rounded-2xl px-3 py-2" style={{ background: 'rgba(255,255,255,0.08)', color: '#f4f6f8' }}>{line}</li>
-                  ))}
-                </ul>
-                <button
-                  type="button"
-                  className="mt-3 w-full text-center text-xs font-semibold underline"
-                  onClick={() => {
-                    void restoreFitBitePro().then((result) => {
-                      if (result.ok && result.active) {
-                        writeUserSubscription({ isPro: true, plan: result.plan ?? proPlan });
-                        patch({ proActive: true });
-                        if (result.plan) setProPlan(result.plan);
-                        showToast('Purchase restored on this device');
-                        setShowPaywall(false);
-                        return;
-                      }
-                      setRestoreNote('No purchase to restore yet.');
-                    });
-                  }}
-                >
-                  Restore Purchases
-                </button>
-                <button
-                  type="button"
-                  className="mt-3 h-11 w-full rounded-full text-sm font-extrabold"
-                  style={{ background: 'rgba(255,255,255,0.1)' }}
-                  onClick={() => setShowPaywall(false)}
-                >
-                  Continue with Free Plan
-                </button>
-                {restoreNote && <p className="mt-3 text-xs leading-relaxed text-[#d6d3d1]">{restoreNote}</p>}
-                <p className="mt-2 text-[10px] leading-relaxed text-[#9aa3b2]">{t('disclaimer')}</p>
-              </div>
-            </div>
+            <ProPaywall
+              t={t}
+              locale={lang}
+              isPro={isPro}
+              reason={paywallReason}
+              onClose={() => setShowPaywall(false)}
+              onActivated={(_subscription, restored) => {
+                patch({ proActive: true });
+                showToast(restored ? t('pwRestored') : t('pwWelcome'));
+                setShowPaywall(false);
+              }}
+              onEnded={() => {
+                patch({ proActive: false });
+                setShowPaywall(false);
+              }}
+              onLegal={(kind) => setLegal(kind)}
+            />
           )}
+
+          {legal && <LegalModal kind={legal} url={APP_LEGAL_URLS[legal]} t={t} onClose={() => setLegal(null)} />}
 
           {scanOpen && (
             <div className="fixed inset-0 z-50 grid place-items-end bg-black/55 px-3 pb-6 backdrop-blur-md sm:place-items-center" onClick={() => setScanOpen(false)}>

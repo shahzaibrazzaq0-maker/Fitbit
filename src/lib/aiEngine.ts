@@ -1,3 +1,7 @@
+import { dietRuleLine, readDiet } from '@/lib/dietProfile';
+import { aiLanguageName, readLang } from '@/lib/i18n';
+import { readUnits, unitRuleLine } from '@/lib/units';
+
 const AI_CACHE_KEY = 'fitbite_ai_cache_v1';
 
 let route = 'Auto-Fusion';
@@ -198,7 +202,7 @@ async function postAi(body: Record<string, unknown>, timeoutMs = 45000) {
       const response = await fetch(aiEndpoint(), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ ...body, prefs: requestPreferences() }),
         signal: AbortSignal.timeout(timeoutMs),
       });
       const raw = await response.text();
@@ -317,8 +321,18 @@ function challengeFromModel(raw: string, seed: number): WellnessChallenge {
   }
 }
 
-export function preferencePrompt(languageName: string, dietLine: string) {
-  return [`Reply in ${languageName}.`, dietLine].filter(Boolean).join('\n');
+/** Language, diet, and unit rules for every AI prompt. Arguments override the saved profile. */
+export function preferencePrompt(languageName?: string, dietLine?: string) {
+  return [
+    `Reply in ${languageName ?? aiLanguageName(readLang())}.`,
+    dietLine ?? dietRuleLine(readDiet()),
+    unitRuleLine(readUnits()),
+  ].filter(Boolean).join('\n');
+}
+
+/** Sent beside every request so the server can enforce the same rules. */
+function requestPreferences() {
+  return { language: aiLanguageName(readLang()), units: readUnits(), diet: dietRuleLine(readDiet()) };
 }
 
 export async function suggestDailyChallenge(input: { waterL: number; meals: number; workouts: number; seed: number; language?: string; diet?: string }): Promise<WellnessChallenge> {
